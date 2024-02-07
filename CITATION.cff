@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Kodge"
+  given-names: "Sangamesh"
+  orcid: "https://orcid.org/0000-0001-9713-5400"
+- family-names: "Saha"
+  given-names: "Gobinda"
+  orcid: "https://orcid.org/0000-0001-5756-6679"
+- family-names: "Roy"
+  given-names: "Kaushik"
+  orcid: "https://orcid.org/0000-0002-0735-9695"
+title: "Deep Unlearning: Fast and Efficient Training-free Approach to Controlled Forgetting"
+#version: 2.0.4
+doi: 10.48550/arXiv.2312.00761
+date-released: 2023-12-1
+url: "https://arxiv.org/abs/2312.00761"

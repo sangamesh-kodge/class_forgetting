@@ -56,6 +56,173 @@ def get_likelihood_ratio(test_features, model_parameters):
 
 
 
+def get_salun_mask(args, model, device, forget_loader):
+    
+    if args.unlearn_method != "salun":
+        return None 
+    mask = {}
+    for name, param in model.named_parameters():
+        mask[name] = 0
+    model.train()
+    for data, target in forget_loader:
+            model.zero_grad()
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            loss = F.nll_loss(output, target, reduction='sum')
+            loss.backward()
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        mask[name] += param.grad.data
+    with torch.no_grad():
+        for name in mask:
+            mask[name] = torch.abs_(mask[name])
+
+    
+    sorted_dict_positions = {}
+    hard_dict = {}
+
+    # Concatenate all tensors into a single tensor
+    all_elements = - torch.cat([tensor.flatten() for tensor in mask.values()])
+
+    # Calculate the threshold index for the top 10% elements
+    threshold_index = int(len(all_elements) * args.salun_threshold)
+
+    # Calculate positions of all elements
+    positions = torch.argsort(all_elements)
+    ranks = torch.argsort(positions)
+
+    start_index = 0
+    for key, tensor in mask.items():
+        num_elements = tensor.numel()
+        # tensor_positions = positions[start_index: start_index + num_elements]
+        tensor_ranks = ranks[start_index : start_index + num_elements]
+
+        sorted_positions = tensor_ranks.reshape(tensor.shape)
+        sorted_dict_positions[key] = sorted_positions
+
+        # Set the corresponding elements to 1
+        threshold_tensor = torch.zeros_like(tensor_ranks)
+        threshold_tensor[tensor_ranks < threshold_index] = 1
+        threshold_tensor = threshold_tensor.reshape(tensor.shape)
+        hard_dict[key] = threshold_tensor
+        start_index += num_elements    
+    return hard_dict
+
+
+def salun_unlearn(args, model, device, retain_loader, forget_loader, train_loader, test_loader, optimizer, epochs, **kwargs):
+    mask = get_salun_mask(args, model, device, forget_loader)     
+    model.train()
+    train_loss= 0
+    train_forget_acc =100.0
+    steps = 0
+    # Random relabeling
+    forget_dataset = copy.deepcopy(forget_loader.dataset)
+    forget_dataset.update_labels(np.random.randint(0, args.num_classes, len(forget_dataset) ))
+    forget_dataset, _ = torch.utils.data.random_split(forget_dataset, [args.num_forget_samples, len(forget_dataset) - args.num_forget_samples])
+    
+    #Subsample retain set. 
+    retain_dataset = retain_loader.dataset
+    retain_dataset, _ = torch.utils.data.random_split(retain_dataset, [args.num_retain_samples, len(retain_dataset) - args.num_retain_samples])
+
+    train_dataset = torch.utils.data.ConcatDataset([forget_dataset,retain_dataset])
+
+    salun_train_loader= torch.utils.data.DataLoader( train_dataset, batch_size=args.batch_size, shuffle=True)
+
+    max_steps = epochs*(len(train_dataset)//args.batch_size)
+
+    for epoch in range(epochs):
+        for data, target in salun_train_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            loss = F.nll_loss(output, target)
+            optimizer.zero_grad()
+            loss.backward()
+            steps+=1
+            if mask:
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        param.grad *= mask[name]
+            optimizer.step()
+            train_loss += loss.detach().item()
+
+ 
+            if args.dry_run:
+                break        
+        if args.dry_run:
+            break    
+    return model
+
+
+def getRetrainLayers(m, name, ret):
+    if isinstance(m, nn.Conv2d) or isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.Linear):
+        ret.append((m, name))
+        #print(name)
+    for child_name, child in m.named_children():
+        ret = getRetrainLayers(child, f'{name}.{child_name}', ret)
+    return ret
+
+def _reinit(m):
+    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+        init.kaiming_normal_(m.weight)
+        if m.bias is not None:
+            m.bias.data.fill_(0)
+    if isinstance(m, nn.BatchNorm2d):
+        nn.init.constant_(m.weight, 1)
+        nn.init.constant_(m.bias, 0)
+
+def resetFinalResnet(model, num_retrain, reinit=True):
+    for param in model.parameters():
+        param.requires_grad = False
+    done = 0
+    ret = getRetrainLayers(model, 'M', [])
+    ret.reverse()
+    for idx in range(len(ret)):
+        if reinit:
+            if isinstance(ret[idx][0], nn.Conv2d) or isinstance(ret[idx][0], nn.Linear):
+                _reinit(ret[idx][0])
+                logger.info(f'Reinitialized layer: {ret[idx][1]}')
+        if isinstance(ret[idx][0], nn.Conv2d) or isinstance(ret[idx][0], nn.Linear):
+            done += 1
+        for param in ret[idx][0].parameters():
+            param.requires_grad = True
+        if done >= num_retrain:
+            break
+    return model
+    
+
+def goel_last_unlearn(args, model, device, retain_loader, forget_loader, train_loader, test_loader, optimizer, epochs, **kwargs):
+    train_loss= 0
+    train_forget_acc =100.0
+    steps = 0    
+    #Subsample retain set. 
+    retain_dataset = retain_loader.dataset
+    retain_dataset, _ = torch.utils.data.random_split(retain_dataset, [args.num_retain_samples, len(retain_dataset) - args.num_retain_samples])
+    
+    goel_train_loader= torch.utils.data.DataLoader( retain_dataset, batch_size=args.batch_size, shuffle=True)
+  
+    model.train()
+    model = resetFinalResnet(model, 1, reinit=args.goel_exact)
+    
+    for epoch in range(epochs):
+        for data, target in goel_train_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            loss = F.nll_loss(output, target)
+            optimizer.zero_grad()
+            loss.backward()
+            steps+=1
+            optimizer.step()
+            train_loss += loss.detach().item()
+                    
+            if args.dry_run:
+                break        
+        if args.dry_run:
+            break  
+    return model
+
+
+
 def calc_importance(model, device, optimizer, dataloader) :
         """
         https://github.com/if-loops/selective-synaptic-dampening
@@ -543,6 +710,12 @@ def main():
     parser.add_argument('--unlearn-method', type=str, default="retrain",
                         help='')
 
+    parser.add_argument('--salun-threshold', type=float, default=0.1,
+                        help='')
+
+    parser.add_argument('--goel-exact', action="store_true", default=False,
+                        help='')
+
     parser.add_argument('--ssd-lambda', type=float, default=1,
                         help='')
     parser.add_argument('--ssd-alpha', type=float, default=10,
@@ -648,6 +821,11 @@ def main():
         group_name = f"{group_name}-{args.lr}-{args.tarun_impair_lr}-{args.tarun_samples_per_class}"
     elif args.unlearn_method == "scrub":
         group_name = f"{group_name}-{args.scrub_del_bsz}-{args.scrub_sgda_bsz}-{args.lr}"
+    elif args.unlearn_method == "goel":
+        if args.goel_exact:
+            group_name = f"{group_name}-exact"
+    elif args.unlearn_method == "salun":
+        group_name = f"{group_name}-{args.lr}-{args.salun_threshold}"
     else:
         group_name = f"{group_name}-{args.lr}"
 
@@ -690,6 +868,9 @@ def main():
         unlearn_model = model
     else:
         unlear_func = {
+            "rl" : salun_unlearn,
+            "salun": salun_unlearn,
+            "goel":goel_last_unlearn,
             "ssd":ssd_unlearn,
             "scrub":scrub_unlearn,
             "our":our_unlearn,
@@ -897,6 +1078,8 @@ def main():
     wandb.finish()
 
     if args.save_model:
+        if not os.path.exists("./pretrained_models/baseline/"):
+            os.makedirs("./pretrained_models/baseline/")
         torch.save(model.state_dict(), f"./pretrained_models/baseline/{args.dataset}_{args.arch}_{args.unlearn_method}_{','.join([str(val) for val in args.unlearn_class])}.pt")
 
 

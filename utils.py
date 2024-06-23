@@ -1,5 +1,4 @@
 
-from __future__ import print_function
 import torch
 import torch.nn.functional as F
 import wandb
@@ -17,6 +16,9 @@ from models.resnet import ResNet18, ResNet34, ResNet50, ResNet101, ResNet152
 from models.vit import vit_b_16, vit_b_32,  vit_l_16, vit_l_32, vit_h_14
 from torchvision import datasets, transforms
 from collections import defaultdict
+from sklearn.svm import SVC
+import os
+from torch.utils.data import Dataset
 
 np.set_printoptions(suppress=True)
 
@@ -130,6 +132,34 @@ def get_dataset(args):
         raise ValueError
     return dataset1, dataset2
 
+class SubSet(Dataset):
+    r"""
+    Subset of a dataset at specified indices.
+
+    Arguments:
+        dataset (Dataset): The whole Dataset
+        indices (sequence): Indices in the whole set selected for subset
+        labels(sequence) : targets as required for the indices. will be the same length as indices
+    """
+    def __init__(self, dataset, indices):
+        self.dataset = dataset
+        self.indices = indices
+        labels = torch.LongTensor([ self.dataset.targets[i] for i in indices ] )
+        labels_hold = torch.ones(len(dataset)).type(torch.long) *10000 #( some number not present in the #labels just to make sure
+        labels_hold[self.indices] = labels 
+        self.labels = labels_hold
+    def __getitem__(self, idx):
+        image = self.dataset[self.indices[idx]][0]
+        label = self.labels[self.indices[idx]]
+        return (image, label)
+    def update_labels(self, new_labels):
+        labels_hold = torch.ones(len(self.dataset)).type(torch.long) *10000 #( some number not present in the #labels just to make sure
+        labels_hold[self.indices] = torch.LongTensor(new_labels)
+        self.labels = labels_hold
+
+
+    def __len__(self):
+        return len(self.indices)
 
 def get_retain_forget_partition(args, dataset, unlearn_class_list, return_ind = False):
     retain_ind = []
@@ -143,8 +173,8 @@ def get_retain_forget_partition(args, dataset, unlearn_class_list, return_ind = 
             forget_ind.append(sample_index)
         else:
             retain_ind.append(sample_index)
-    retain_dataset = torch.utils.data.Subset(dataset, retain_ind)
-    forget_dataset = torch.utils.data.Subset(dataset, forget_ind)
+    retain_dataset = SubSet(dataset, retain_ind)
+    forget_dataset = SubSet(dataset, forget_ind)
     if return_ind:
         return retain_dataset, forget_dataset, retain_ind, forget_ind
 
@@ -192,173 +222,7 @@ def get_model(args,device):
         raise ValueError
     return model
 
-def get_representation_matrix_class(net, device, data_loader, class_labels=[], num_classes = 10,
-                               samples_per_class=150, max_batch_size=150, max_samples=50000, set_name = "Retain Set"): 
-    if class_labels: 
-        # sort data per class and collect samples from required class.
-        samples_list = []
-        samples_per_class_count = defaultdict(int)
-        total_classes = len(class_labels)
-        pbar = tqdm(data_loader)
-        for data, target in pbar:
-            pbar.set_description(f"Collecting Subset of Samples {set_name}:{sum(list(samples_per_class_count.values()))}/{samples_per_class*total_classes}")
-            y_sorted, indices = target.sort()
-            indices = torch.LongTensor(indices)
-            x_sorted = data[indices]
-            sample_counts = Counter(y_sorted.cpu().numpy())
-            for class_number in range(num_classes):
-                if class_number in class_labels:
-                    if samples_per_class_count[class_number] == samples_per_class:
-                        continue
-                    elif samples_per_class_count[class_number] + sample_counts[class_number] > samples_per_class:
-                        samples_list.append(x_sorted[0:samples_per_class - samples_per_class_count[class_number] ])
-                        samples_per_class_count[class_number]  = samples_per_class
-                    else:
-                        samples_list.append(x_sorted[0:sample_counts[class_number]])  
-                        samples_per_class_count[class_number] += sample_counts[class_number] 
-                if sum(list(samples_per_class_count.values())) == samples_per_class*total_classes:
-                    break
-                x_sorted = x_sorted[sample_counts[class_number]:]
-            if sum(list(samples_per_class_count.values())) == samples_per_class*total_classes:
-                pbar.set_description(f"Collecting Subset of Samples {set_name}:{sum(list(samples_per_class_count.values()))}/{samples_per_class*total_classes}")
-                break
-        sample_tensor = torch.cat(samples_list, 0).to(device)
-        # Gets prepresentations as dict of dicts # form dataloader without transform
-        activations = None 
-        net.eval()
-        for batch in tqdm(torch.split(sample_tensor, max_batch_size, dim=0), desc=f"Extracting representation for {set_name}"):
-            batch_activations = net.get_activations(batch)
-            ### Instantinously compress the batch
-            for loc in batch_activations.keys():
-                for key in batch_activations[loc].keys():
-                    if batch_activations[loc][key].shape[0]> (int(max_samples/(sample_tensor.shape[0]/max_batch_size)) +1):
-                        ### Shuffle and return a subset of patches
-                        r=np.arange(batch_activations[loc][key].shape[0])
-                        np.random.shuffle(r)
-                        b = r[:(int(max_samples/(sample_tensor.shape[0]/max_batch_size)) +1)]
-                        batch_activations[loc][key] = batch_activations[loc][key][b].copy()
-            ### Concatinate the samples
-            if activations:
-                for loc in batch_activations.keys():
-                    for key in batch_activations[loc].keys():
-                        activations[loc][key] = np.concatenate([activations[loc][key],batch_activations[loc][key]], 0)
-            else:
-                activations = batch_activations
-        ### Final check for reducing the sample size
-        sampled_activations={"pre":OrderedDict(),"post":OrderedDict(),}
-        for loc in batch_activations.keys():
-            for key in batch_activations[loc].keys():
-                if activations[loc][key].shape[0]> max_samples:
-                    ### Shuffle and return a subset of patches
-                    r=np.arange(activations[loc][key].shape[0])
-                    np.random.shuffle(r)
-                    b = r[:max_samples]
-                    sampled_activations[loc][key] = activations[loc][key][b].copy()
-                else:
-                    sampled_activations[loc][key] = activations[loc][key].copy()
-        # Transpose activations
-        loc_keys = list(sampled_activations.keys())
-        mat_dict={loc:OrderedDict() for loc in loc_keys}
-        for loc in loc_keys:
-            for act in list(sampled_activations[loc].keys()):
-                activation = sampled_activations[loc][act].transpose()
-                mat_dict[loc][act]= activation
-        #Prints the representation shapes.
-        for loc in loc_keys:
-            print('-'*30)
-            print(f'Representation Matrix {loc} Layer for {set_name}')
-            print('-'*30)    
-            for act in list(sampled_activations[loc].keys()):
-                print (f' Layer {act} : [{mat_dict[loc][act].shape}]')
-            print('-'*30)
-        return mat_dict
-    else:
-        return {loc:OrderedDict() for loc in ["pre", "post"]}
-   
-def get_SVD (mat_dict,   set_name = "SVD"):
-    feature_dict = {"pre":OrderedDict(), "post":OrderedDict()}
-    s_dict = {"pre":OrderedDict(), "post":OrderedDict()}
-    for loc in mat_dict.keys():
-        for act in tqdm(mat_dict[loc].keys(), desc=f"{loc}layer - SVD for {set_name}"):
-            activation = torch.Tensor(mat_dict[loc][act]).to("cuda")
-            U,S,Vh = torch.linalg.svd(activation, full_matrices=False)
-            U = U.cpu().numpy()
-            S = S.cpu().numpy()            
-            feature_dict[loc][act] = U
-            s_dict[loc][act] = S
-    return feature_dict,  s_dict
-
-def select_basis(feature_dict, full_s_dict, threshold):
-    if threshold is None:
-        return feature_dict
-    out_feature_dict = {"pre":OrderedDict(), "post":OrderedDict()}
-    for loc in feature_dict.keys():
-        for act in feature_dict[loc].keys():
-            U = feature_dict[loc][act]
-            S = full_s_dict[loc][act]
-            sval_total = (S**2).sum()
-            sval_ratio = (S**2)/sval_total
-            r = np.sum(np.cumsum(sval_ratio)<threshold) +1  
-            out_feature_dict[loc][act] = U[:,:r]
-    print('-'*40)
-    print(f'Gradient Constraints Summary')
-    print('-'*40)
-    for loc in range(feature_dict.keys()):
-        for act in range(feature_dict[loc].keys()):
-            print (f'{loc} layer {act} : {out_feature_dict[act].shape[1]}/{out_feature_dict[act].shape[0]}')
-    print('-'*40)
-    return out_feature_dict
-
-def get_scaled_feature_mat(feature_dict, full_s_dict, mode, alpha, device):
-    feature_mat_dict = {"pre":OrderedDict(), "post":OrderedDict()}
-    # Projection Matrix Precomputation
-    for loc in feature_dict.keys():
-        for act in feature_dict[loc].keys():
-            U = torch.Tensor( feature_dict[loc][act] ).to(device)
-            S = full_s_dict[loc][act]
-            r = U.shape[1]
-            if mode == "baseline":
-                importance = torch.ones(r).to(device) 
-            elif mode == "gpm":
-                importance = torch.ones(r).to(device) 
-            elif mode == "sgp":
-                importance = torch.Tensor(( alpha*S/( (alpha-1)*S+max(S)) )[:r]).to(device) 
-            elif mode == "sap":
-                sval_total = (S**2).sum()
-                sval_ratio = (S**2)/sval_total
-                importance =  torch.Tensor(( alpha*sval_ratio/((alpha-1)*sval_ratio+1) ) [:r]).to(device) 
-            else:
-                raise ValueError
-            U.requires_grad = False
-            feature_mat_dict[loc][act] = torch.mm( U, torch.diag(importance**0.5) )
-    return feature_mat_dict
-
-def get_projections(feature_mat_retain_dict, feature_mat_unlearn_dict,projection_type, device):
-    feature_mat = {"pre":OrderedDict(), "post":OrderedDict()}
-    for loc in feature_mat_retain_dict.keys():
-        for act in feature_mat_retain_dict[loc].keys():
-            Ur = feature_mat_retain_dict[loc][act]
-            Uf = feature_mat_unlearn_dict[loc][act]  
-            Mr = torch.mm(Ur, Ur.transpose(0,1))     
-            Mf = torch.mm(Uf, Uf.transpose(0,1))
-            I = torch.eye(Mf.shape[0]).to(device) 
-            Mri = torch.mm(Mr, Mf) # Intersection in terms of retain space basis
-            Mfi = torch.mm(Mf, Mr)  # Intersection in terms of forget space basis
-            # Select type of projection. 
-            if projection_type == "baseline":
-                feature_mat[loc][act]= I 
-            elif projection_type == "Mr":
-                feature_mat[loc][act]= Mr                       
-            elif projection_type == "I-(Mf-Mi)":
-                feature_mat[loc][act]= I - (Mf - Mfi)
-            # elif projection_type == "I-Mf":
-            #     feature_mat[loc][act]= I - Mf   
-            # elif projection_type == "Mr-Mi":
-            #     feature_mat[loc][act]= Mr - Mri        
-            else:
-                raise ValueError
-    return feature_mat
-
+    
 def metric_function(x, y):
     out= x *(1 - y)
     return out
@@ -402,15 +266,18 @@ def test(model, device, data_loader,  unlearn_class_list, class_label_names, num
         fig.set_size_inches(10,10)
         plt.style.use("seaborn-talk")
         cs = sns.color_palette("muted")
-        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_label_names )
+        short_labels = []
+        for label in class_label_names:
+            short_labels.append(label[0:4])
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=short_labels )
         disp.plot(cmap='Greens', values_format='.0f')
         for labels in disp.text_.ravel():
-            labels.set_fontsize(15)
+            labels.set_fontsize(20)
         # plt.title(f"{set_name} Class removed {unlearn_class_name} : {job_name}")
-        plt.xticks(rotation=45, ha='right', fontsize=20)
-        plt.yticks(rotation=45, fontsize=20)
-        plt.xlabel("Predicted Labels", fontsize=20)
-        plt.ylabel("True Lables", fontsize=20)
+        plt.xticks(rotation=45, ha='right', fontsize=25)
+        plt.yticks(rotation=45, fontsize=25)
+        plt.xlabel("Predicted Labels", fontsize=30)
+        plt.ylabel("True Lables", fontsize=30)
         plt.tight_layout()
         plt.savefig(f"./class_removal/images/cm_{set_name}_{unlearn_class_name}_{job_name}.pdf")
         
@@ -435,185 +302,82 @@ def test(model, device, data_loader,  unlearn_class_list, class_label_names, num
                     }
                     )
     return retain_acc, forget_acc, metric
-    
-def activation_projection_based_unlearning(args, model, train_loader, val_loader, test_loader, device):
-    # Initial Evaluation
-    if not args.save_model:
-        if args.val_set_mode:
-            base_ra, base_fa, base_metric = test(model, device, val_loader, args.unlearn_class, class_label_names=args.class_label_names, num_classes = args.num_classes, set_name="Val Set", verbose=False)
-            _ = test(model, device, test_loader, args.unlearn_class, class_label_names=args.class_label_names, num_classes = args.num_classes, set_name="Test Set", verbose=False)
-        else:
-            base_ra, base_fa, base_metric = test(model, device, train_loader, args.unlearn_class, class_label_names=args.class_label_names, num_classes = args.num_classes, set_name="Train Set", verbose=False)
-            _ = test(model, device, test_loader, args.unlearn_class, class_label_names=args.class_label_names, num_classes = args.num_classes, set_name="Test Set", verbose=False)
-    else:
-        base_metric = 0
-    best_model = copy.deepcopy(model)
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
 
-    # Gets the basis vectors for retain set    
-    retain_classes = [c for c in range(args.num_classes) if (c not in args.unlearn_class and c not in args.ignore_class) ]
-    mat_retain_dict = get_representation_matrix_class(model, device, train_loader, class_labels=retain_classes
-                                                                  , num_classes = args.num_classes, samples_per_class=args.retain_samples, max_batch_size=args.max_batch_size, max_samples=args.max_samples, set_name = "Retain Set")  
-    # Gets the basis vectors for Forget set
-    full_feature_retain_dict, full_s_retain_dict = get_SVD( mat_retain_dict,f"SVD Retain Set") 
-    mat_unlearn_dict= get_representation_matrix_class(model, device, train_loader, class_labels=args.unlearn_class # don't use ignore_class here!
-                                                                  , num_classes = args.num_classes, samples_per_class=args.forget_samples, max_batch_size=args.max_batch_size, max_samples=args.max_samples, set_name = "Forget Set")  
-    full_feature_unlearn_dict, full_s_unlearn_dict= get_SVD( mat_unlearn_dict,f"SVD Forget Set") 
-    #update unlearn classes
-    args.unlearn_class  = [c for c in range(args.num_classes) if (c in args.unlearn_class or c in args.ignore_class) ]
-    num_layer = len(full_feature_retain_dict["pre"])
-    for mode in args.mode:
-        # Iterate over all the retain modes
-        for mode_forget in args.mode_forget:
-            # Iterate over all the forget modes
-            for projection_type in args.projection_type:
-                # Iterate over all the projection types
-                for start in args.start_layer:
-                    for end in args.end_layer:   
-                        # Loop to update feature mat to ignore layers between start and num_layers-end
-                        # Set retain eps_threshold and scale_coff_list and get the basis
-                        if mode == "baseline":
-                            scale_coff_list = [0]
-                            eps_threshold = None
-                        elif mode == "gpm":
-                            scale_coff_list = [0]
-                            eps_threshold = args.gpm_eps
-                        else:
-                            scale_coff_list = args.scale_coff   
-                            eps_threshold = None
-                        for projection_location in args.projection_location:
-                            # Iterate over all the projection location
-                            best_metric = base_metric  
-                            for alpha in scale_coff_list:                            
-                                # Set forget eps_threshold and scale_coff_list and get the basis 
-                                if mode_forget is None:
-                                    mode_forget = mode
-                                    scale_coff_list_forget = [alpha]
-                                    eps_threshold_forget = eps_threshold
-                                elif mode_forget == "baseline":
-                                    scale_coff_list_forget = [0]
-                                    eps_threshold_forget = None
-                                elif mode_forget == "gpm":
-                                    scale_coff_list_forget = [0]
-                                    eps_threshold_forget = args.gpm_eps
-                                else:
-                                    if projection_type =="I-(Mf-Mi)":
-                                        scale_coff_list_forget =[val for val in args.scale_coff_forget if alpha/1000<val]
-                                    elif projection_type == "Mr" or projection_type == "baseline":
-                                        scale_coff_list_forget =[0]
-                                    else:
-                                        print(projection_type)
-                                        raise ValueError
-                                    eps_threshold_forget = None
-                                # Obtain the feature_matrix for retain space Mr
-                                feature_retain_dict  = select_basis(full_feature_retain_dict, full_s_retain_dict, eps_threshold) 
-                                feature_mat_retain_dict = get_scaled_feature_mat(feature_retain_dict, full_s_retain_dict, mode, alpha, device)  
-                                terminate_alpha = False                             
-                                for alpha_forget in scale_coff_list_forget: 
-                                    if terminate_alpha: 
-                                        # This parameter set at the end of the loop
-                                        break
-                                    # Set wandb parameters 
-                                    if mode==mode_forget=="baseline" and projection_type=="baseline":
-                                        job_name = "baseline" 
-                                    elif mode==mode_forget=="baseline" and projection_type!="baseline":
-                                        continue
-                                    elif projection_type=="baseline":
-                                        continue
-                                    elif (mode=="baseline" and mode_forget!="baseline") or (mode!="baseline" and mode_forget=="baseline"):
-                                        continue
-                                    else:
-                                        job_name = f"{mode}({alpha})"  if not(mode=="baseline" ) else "baseline"
-                                        job_name = f"{job_name}-{mode_forget}({alpha_forget})"  if not(mode_forget=="baseline") else f"{job_name}-baseline"
-                                        job_name = f"{job_name}:{projection_type}" if not(projection_type =="baseline" or (mode_forget=="baseline" and mode=="baseline")) else "baseline"
-                                    job_name = f"{job_name}:{start}-{num_layer-end}"
-                                    # Obtain the feature_matrix for forget space Mf
-                                    feature_unlearn_dict  = select_basis(full_feature_unlearn_dict, full_s_unlearn_dict, eps_threshold_forget)  
-                                    feature_mat_unlearn_dict = get_scaled_feature_mat(feature_unlearn_dict, full_s_unlearn_dict, mode_forget, alpha_forget, device)                    
-                                    # Get the projection matrix using Mf and Mr
-                                    projection_mat = get_projections(feature_mat_retain_dict, feature_mat_unlearn_dict,projection_type, device)
-                                    # Modify the projection matrix to respect the layers and the projection location in consideration (Puts identity when layer/projection location not in consideration)
-                                    modified_projection_mat = {"pre":OrderedDict(), "post":OrderedDict()}
-                                    for loc in projection_mat.keys():
-                                        for i,act in enumerate(projection_mat[loc].keys()):
-                                            if i<start:
-                                                modified_projection_mat[loc][act] = torch.eye(projection_mat[loc][act].shape[0]).to(device)
-                                            elif i>num_layer-end:
-                                                modified_projection_mat[loc][act] = torch.eye(projection_mat[loc][act].shape[0]).to(device)
-                                            elif projection_location != "all" and (loc!=projection_location): 
-                                                modified_projection_mat[loc][act] = torch.eye(projection_mat[loc][act].shape[0]).to(device)
-                                            else:
-                                                modified_projection_mat[loc][act] = projection_mat[loc][act]
-                                    # Copy of the orignial trained model and project its weight.
-                                    inference_model = copy.deepcopy(model)
-                                    inference_model.project_weights(modified_projection_mat)
-                                    if args.save_model:
-                                        ra, fa, _ = test(inference_model, device, test_loader, args.unlearn_class, class_label_names=args.class_label_names, num_classes = args.num_classes, set_name="Test Set", verbose=False)
-                                        print(ra, fa)
-                                        torch.save(inference_model.state_dict(), f"./class_removal/pretrained_models/main/{args.dataset}_{args.arch}_forget{args.unlearn_class}.pt")
-                                        return 
-                                    # Instantiate wandb. 
-                                    if args.multiclass:
-                                        run = wandb.init(
-                                            # Set the project where this run will be logged
-                                            project=f"Class-{args.dataset}-{args.project_name}",
-                                            group= f"{projection_location}layer-{args.group_name}-{args.arch}", 
-                                            name=job_name,
-                                            # Track hyperparameters and run metadata
-                                            config= vars(args))    
-                                    else:
-                                        run = wandb.init(
-                                            # Set the project where this run will be logged
-                                            project=f"Class-{args.dataset}-{args.project_name}",
-                                            group= f"{projection_location}layer-{args.group_name}-{args.arch}-{args.unlearn_class}", 
-                                            name=job_name,
-                                            # Track hyperparameters and run metadata
-                                            config= vars(args))
-                                    print(args.unlearn_class )
-                                    # Evaluates the projection. Prints Confusion matrix and returns retain acc and forget acc.
-                                    if args.val_set_mode:
-                                        ra,fa, metric = test(inference_model, device, val_loader, args.unlearn_class, class_label_names=args.class_label_names, num_classes = args.num_classes, set_name="Val Set")                                     
-                                        _ = test(inference_model, device, test_loader, args.unlearn_class, class_label_names=args.class_label_names, num_classes = args.num_classes, set_name="Test Set", plot_cm=args.plot_cm, job_name=f"{args.arch}_{job_name}")
-                                    else:
-                                        ra,fa, metric = test(inference_model, device, train_loader, args.unlearn_class, class_label_names=args.class_label_names, num_classes = args.num_classes, set_name="Train Set")
-                                        _ = test(inference_model, device, test_loader, args.unlearn_class, class_label_names=args.class_label_names, num_classes = args.num_classes, set_name="Test Set", plot_cm=args.plot_cm, job_name=f"{args.arch}_{job_name}")
-                                    wandb.finish()                                        
-                                    # Search space reduction (Needs baseline acc => the first mode and mode-forget must be set to baseline.)
-                                    if metric > best_metric:
-                                        best_model = copy.deepcopy(inference_model)
-                                        best_metric = metric
 
-                                    if ra < best_metric or (fa < 1/args.num_classes):
-                                        # Terminate alpha_forget search as increase in alpha_forget decrease retain acc. (Less than 0.9*base_retain not acceptable)
-                                        # Terminate alpha_forget search as minimum accuracy attained. Further increase will reduce retain acc. 
-                                        terminate_alpha  = True
-                                    else:
-                                        continue
-    end_event.record()
-    torch.cuda.synchronize()  # Wait for the events to be recorded!
-    elapsed_time_ms = start_event.elapsed_time(end_event)
-    if args.multiclass:
-        run = wandb.init(
-                    # Set the project where this run will be logged
-                    project=f"Class-{args.dataset}-{args.project_name}",
-                    group= f"{projection_location}layer-{args.group_name}-{args.arch}", 
-                    name="sim_time",
-                    # Track hyperparameters and run metadata
-                    config= vars(args)
-        )  
-    else:
-        run = wandb.init(
-                    # Set the project where this run will be logged
-                    project=f"Class-{args.dataset}-{args.project_name}",
-                    group= f"{projection_location}layer-{args.group_name}-{args.arch}-{args.unlearn_class}", 
-                    name="sim_time",
-                    # Track hyperparameters and run metadata
-                    config= vars(args)
-        )       
-    wandb.log({"run_time":elapsed_time_ms})
-    wandb.finish()   
-    return best_model
-    
-    
+
+
+### Simple MIA
+def collect_prob(data_loader, model):
+    if data_loader is None:
+        return torch.zeros([0, 10]), torch.zeros([0])
+
+    prob = []
+    targets = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch in data_loader:
+            batch = [tensor.to(next(model.parameters()).device)
+                     for tensor in batch]
+            data, target = batch
+
+            with torch.no_grad():
+                log_prob = model(data) # Returns log_prob. exp( ) 
+                prob.append(torch.exp(log_prob).data)
+                targets.append(target)
+
+    return torch.cat(prob), torch.cat(targets)
+
+
+def SVC_fit_predict(shadow_train, shadow_test, target_train, target_test):
+    n_shadow_train = shadow_train.shape[0]
+    n_shadow_test = shadow_test.shape[0]
+    n_target_train = target_train.shape[0]
+    n_target_test = target_test.shape[0]
+
+    X_shadow = torch.cat([shadow_train, shadow_test]).cpu(
+    ).numpy().reshape(n_shadow_train + n_shadow_test, -1)
+    Y_shadow = np.concatenate(
+        [np.ones(n_shadow_train), np.zeros(n_shadow_test)])
+
+    clf = SVC(C=3, gamma='auto', kernel='rbf')
+    clf.fit(X_shadow, Y_shadow)
+
+    accs = []
+
+    if n_target_train > 0:
+        X_target_train = target_train.cpu().numpy().reshape(n_target_train, -1)
+        acc_train = clf.predict(X_target_train).mean()
+        accs.append(acc_train)
+
+    if n_target_test > 0:
+        X_target_test = target_test.cpu().numpy().reshape(n_target_test, -1)
+        acc_test = 1 - clf.predict(X_target_test).mean()
+        accs.append(acc_test)
+
+    return np.mean(accs)
+
+
+def SVC_MIA(shadow_train, target_train, target_test, shadow_test, model):
+    shadow_train_prob, shadow_train_labels = collect_prob(shadow_train, model)
+    shadow_test_prob, shadow_test_labels = collect_prob(shadow_test, model)
+
+    target_train_prob, target_train_labels = collect_prob(target_train, model)
+    target_test_prob, target_test_labels = collect_prob(target_test, model)
+
+    shadow_train_conf = torch.gather(
+        shadow_train_prob, 1, shadow_train_labels[:, None])
+    shadow_test_conf = torch.gather(
+        shadow_test_prob, 1, shadow_test_labels[:, None])
+    target_train_conf = torch.gather(
+        target_train_prob, 1, target_train_labels[:, None])
+    target_test_conf = torch.gather(
+        target_test_prob, 1, target_test_labels[:, None])
+
+    acc_conf = SVC_fit_predict(
+        shadow_train_conf, shadow_test_conf, target_train_conf, target_test_conf)
+    m = {
+         "confidence": acc_conf,
+         }
+    print(m)
+    return m

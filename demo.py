@@ -9,6 +9,7 @@ import numpy as np
 import random
 from tqdm import tqdm
 import seaborn as sns
+import os 
 
 class Linear5(nn.Module):
     def __init__(self, in_feature=2, hidden_features=5, num_classes=4):
@@ -189,7 +190,7 @@ def plot_decision_boundary(model, data, device, title):
     # plt.xticks()
     # plt.yticks(fontsize=30)
     plt.tight_layout()
-    plt.savefig(f"./class_removal/images/demo_{title.split(':')[0].lower()}.pdf")
+    plt.savefig(f"./images/demo_{title.split(':')[0].lower()}.pdf")
     plt.show()
     return
 
@@ -204,6 +205,8 @@ def main():
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if not os.path.exists("./images"):
+        os.makedirs("./images")
     # torch.use_deterministic_algorithms(True)
     device = "cuda"
     data1, data2 = get_dataset(train_samples_per_class, test_samples_per_class, std = std)
@@ -255,7 +258,7 @@ def main():
     plt.ylabel("Feature 2", fontsize=40)
     # plt.legend( fontsize=25)
     plt.tight_layout()
-    plt.savefig(f"./class_removal/images/demo_data.pdf")
+    plt.savefig(f"./images/demo_data.pdf")
     plt.show()
 
     print("-"*40)

@@ -14,8 +14,8 @@ from torchvision.models._meta import _IMAGENET_CATEGORIES
 from torchvision.models._utils import _ovewrite_named_param, handle_legacy_interface
 from collections import OrderedDict
 from copy import deepcopy
-from .model_utils import reshape_conv_input_activation
-
+from .model_utils import reshape_conv_input_activation, forward_cache_activations, forward_cache_projections, forward_cache_svd
+import numpy as np
 
 
 __all__ = [
@@ -138,66 +138,172 @@ class EncoderBlock(nn.Module):
         return attn_output
         
 
-    def get_activations(self, input):      
-        act={"pre":OrderedDict(), "post":OrderedDict()}
-        mlp_ind = 0
+    def get_activations(self, input,  block_key, max_samples=10000):      
+        act=OrderedDict()
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         x = self.ln_1(input)        
-        
         ### Unroll attention here! 
         bsz, seq_len, embed_dim  = x.shape
-        act["pre"][f"self_attn.qkv"] = deepcopy(x.clone().detach().view(-1,  x.shape[-1]).cpu().numpy())
+
+        act[f"{block_key}.self_attn.qkv"] = x.clone().detach().view(-1,  x.shape[-1])
+        indexes = np.arange(act[f"{block_key}.self_attn.qkv"].shape[0])
+        np.random.shuffle(indexes)
+        act[f"{block_key}.self_attn.qkv"] = act[f"{block_key}.self_attn.qkv"][indexes[:max_samples]]
         q, k, v = F._in_projection_packed(x, x, x, self.self_attention.in_proj_weight, self.self_attention.in_proj_bias)
-        act["post"][f"self_attn.query"] = deepcopy(q.clone().detach().view(-1,  q.shape[-1]).cpu().numpy())
-        act["post"][f"self_attn.key"] = deepcopy(k.clone().detach().view(-1,  k.shape[-1]).cpu().numpy())
-        act["post"][f"self_attn.value"] = deepcopy(v.clone().detach().view(-1,  v.shape[-1]).cpu().numpy())
         q = q.view(bsz, seq_len, self.num_heads, embed_dim//self.num_heads).permute(0,2,1,3)
         k = k.view(bsz, seq_len, self.num_heads, embed_dim//self.num_heads).permute(0,2,1,3)
         v = v.view(bsz, seq_len, self.num_heads, embed_dim//self.num_heads).permute(0,2,1,3)
         attn_output = F.scaled_dot_product_attention(q,k,v)
         attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(seq_len*bsz, embed_dim)
-        act["pre"][f"self_attn.out_proj"] = deepcopy(attn_output.clone().detach().view(-1,  attn_output.shape[-1]).cpu().numpy())
+        act[f"{block_key}.self_attn.out_proj"] = attn_output.clone().detach().view(-1,  attn_output.shape[-1])
+        indexes = np.arange(act[f"{block_key}.self_attn.out_proj"].shape[0])
+        np.random.shuffle(indexes)
+        act[f"{block_key}.self_attn.out_proj"] = act[f"{block_key}.self_attn.out_proj"][indexes[:max_samples]]
         attn_output = F.linear(attn_output, self.self_attention.out_proj.weight, self.self_attention.out_proj.bias)
-        act["post"][f"self_attn.out_proj"] = deepcopy(attn_output.clone().detach().view(-1,  attn_output.shape[-1]).cpu().numpy())
+            
+        
         x = attn_output.view(bsz, seq_len, embed_dim)
         x = self.dropout(x)
         x = x + input
         y = self.ln_2(x)        
-        for layer in self.mlp:
+        mlp_ind = 0
+        for layer in self.mlp:            
             if isinstance(layer, nn.Linear):
-                act["pre"][f"mlp.linear{mlp_ind}"] = deepcopy(y.clone().detach().view(-1,  y.shape[-1]).cpu().numpy())
-                y= layer(y)
-                act["post"][f"mlp.linear{mlp_ind}"] = deepcopy(y.clone().detach().view(-1,  y.shape[-1]).cpu().numpy())
-                mlp_ind+=1
+                 layer_name = f"{block_key}.mlp.linear{mlp_ind}"
+                 mlp_ind+=1
             else:
-                y= layer(y)
+                layer_name = ""
+            y_reshaped, layer_acts  = forward_cache_activations(y.view(-1,  y.shape[-1]), layer, layer_name, max_samples)
+            act.update(layer_acts)  
+            y = y_reshaped.view( (y.shape[0], y.shape[1], -1) )
+            
         return act, x+y 
     
-    def project_weights(self, projection_mat_dict):
+    def get_svd_directions(self, input,  block_key, max_samples=10000):      
+        U=OrderedDict()
+        S=OrderedDict()
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+        x = self.ln_1(input)        
+        ### Unroll attention here! 
+        bsz, seq_len, embed_dim  = x.shape
+
+
+        activation =  x.clone().detach().view(-1,  x.shape[-1])
+        indexes = np.arange(activation.shape[0])
+        np.random.shuffle(indexes)
+        activation = activation[indexes[:max_samples]].transpose(0,1)
+        u,s,_ = torch.linalg.svd(activation, full_matrices=False)
+        U[f"{block_key}.self_attn.qkv"] = u
+        S[f"{block_key}.self_attn.qkv"] = s
+        
+        q, k, v = F._in_projection_packed(x, x, x, self.self_attention.in_proj_weight, self.self_attention.in_proj_bias)
+        q = q.view(bsz, seq_len, self.num_heads, embed_dim//self.num_heads).permute(0,2,1,3)
+        k = k.view(bsz, seq_len, self.num_heads, embed_dim//self.num_heads).permute(0,2,1,3)
+        v = v.view(bsz, seq_len, self.num_heads, embed_dim//self.num_heads).permute(0,2,1,3)
+        attn_output = F.scaled_dot_product_attention(q,k,v)
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(seq_len*bsz, embed_dim)
+
+        activation =  attn_output.clone().detach().view(-1,  attn_output.shape[-1])
+        indexes = np.arange(activation.shape[0])
+        np.random.shuffle(indexes)
+        activation = activation[indexes[:max_samples]].transpose(0,1)
+        u,s,_ = torch.linalg.svd(activation, full_matrices=False)
+        U[f"{block_key}.self_attn.out_proj"] = u
+        S[f"{block_key}.self_attn.out_proj"] = s
+
+        attn_output = F.linear(attn_output, self.self_attention.out_proj.weight, self.self_attention.out_proj.bias)
+            
+        
+        x = attn_output.view(bsz, seq_len, embed_dim)
+        x = self.dropout(x)
+        x = x + input
+        y = self.ln_2(x)        
         mlp_ind = 0
+        for layer in self.mlp:            
+            if isinstance(layer, nn.Linear):
+                 layer_name = f"{block_key}.mlp.linear{mlp_ind}"
+                 mlp_ind+=1
+            else:
+                layer_name = ""
+            y_reshaped, layer_u, layer_s  = forward_cache_svd(y.view(-1,  y.shape[-1]), layer, layer_name,  max_samples)
+            U.update(layer_u)  
+            S.update(layer_s)  
+            
+            y = y_reshaped.view( (y.shape[0], y.shape[1], -1) )
+            
+        return U, S, x+y 
+     
+
+    def get_scaled_projections(self, input,  block_key, alpha, max_samples=10000):      
+        proj = OrderedDict()
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+        x = self.ln_1(input)        
+        ### Unroll attention here! 
+        bsz, seq_len, embed_dim  = x.shape
+
+
+        activation =  x.clone().detach().view(-1,  x.shape[-1])
+        indexes = np.arange(activation.shape[0])
+        np.random.shuffle(indexes)
+        activation = activation[indexes[:max_samples]].transpose(0,1)
+        Ur,Sr,_ = torch.linalg.svd(activation, full_matrices=False)
+        sval_total = (Sr**2).sum()
+        sval_ratio = (Sr**2)/sval_total
+        importance_r =  torch.diag( alpha *sval_ratio/((alpha-1)*sval_ratio+1) )
+        mr = torch.mm( Ur, importance_r )
+        proj[f"{block_key}.self_attn.qkv"] =  torch.mm( mr, Ur.transpose(0,1) )
+
+
+        q, k, v = F._in_projection_packed(x, x, x, self.self_attention.in_proj_weight, self.self_attention.in_proj_bias)
+        q = q.view(bsz, seq_len, self.num_heads, embed_dim//self.num_heads).permute(0,2,1,3)
+        k = k.view(bsz, seq_len, self.num_heads, embed_dim//self.num_heads).permute(0,2,1,3)
+        v = v.view(bsz, seq_len, self.num_heads, embed_dim//self.num_heads).permute(0,2,1,3)
+        attn_output = F.scaled_dot_product_attention(q,k,v)
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(seq_len*bsz, embed_dim)
+
+        activation =  attn_output.clone().detach().view(-1,  attn_output.shape[-1])
+        indexes = np.arange(activation.shape[0])
+        np.random.shuffle(indexes)
+        activation = activation[indexes[:max_samples]].transpose(0,1)
+        Ur,Sr,_ = torch.linalg.svd(activation, full_matrices=False)
+        sval_total = (Sr**2).sum()
+        sval_ratio = (Sr**2)/sval_total
+        importance_r =  torch.diag( alpha *sval_ratio/((alpha-1)*sval_ratio+1) )
+        mr = torch.mm( Ur, importance_r )
+        proj[f"{block_key}.self_attn.out_proj"] =  torch.mm( mr, Ur.transpose(0,1) )
+
+        attn_output = F.linear(attn_output, self.self_attention.out_proj.weight, self.self_attention.out_proj.bias)
+            
         
+        x = attn_output.view(bsz, seq_len, embed_dim)
+        x = self.dropout(x)
+        x = x + input
+        y = self.ln_2(x)        
+        mlp_ind = 0
+        for layer in self.mlp:            
+            if isinstance(layer, nn.Linear):
+                 layer_name = f"{block_key}.mlp.linear{mlp_ind}"
+                 mlp_ind+=1
+            else:
+                layer_name = ""
+            y_reshaped, layer_proj  = forward_cache_projections(y.view(-1,  y.shape[-1]), layer, layer_name, alpha, max_samples)
+            proj.update(layer_proj)  
+            y = y_reshaped.view( (y.shape[0], y.shape[1], -1) )
+            
+        return proj, x+y 
+
+    def project_weights(self,  projection_mat_dict, block_key):
         w_q, w_k, w_v = self.self_attention.in_proj_weight.chunk(3)
-        w_q.data = torch.mm(projection_mat_dict["post"][f"self_attn.query"].transpose(0,1) , torch.mm(w_q.data, projection_mat_dict["pre"][f"self_attn.qkv"].transpose(0,1) )).view_as(w_q.data)
-        w_k.data = torch.mm(projection_mat_dict["post"][f"self_attn.key"].transpose(0,1) , torch.mm(w_k.data, projection_mat_dict["pre"][f"self_attn.qkv"].transpose(0,1) )).view_as(w_k.data)
-        w_v.data = torch.mm(projection_mat_dict["post"][f"self_attn.value"].transpose(0,1) , torch.mm(w_v.data, projection_mat_dict["pre"][f"self_attn.qkv"].transpose(0,1) )).view_as(w_v.data)
-        self.self_attention.in_proj_weight.data = torch.cat((w_q.data, w_k.data, w_v.data ), 0)
+        w_q.data = torch.mm(w_q.data, projection_mat_dict[f"{block_key}.self_attn.qkv"].transpose(0,1) ).view_as(w_q.data)
+        w_k.data = torch.mm(w_k.data, projection_mat_dict[f"{block_key}.self_attn.qkv"].transpose(0,1) ).view_as(w_k.data)
+        w_v.data = torch.mm(w_v.data, projection_mat_dict[f"{block_key}.self_attn.qkv"].transpose(0,1) ).view_as(w_v.data)
+        self.self_attention.in_proj_weight.data = torch.cat((w_q.data, w_k.data, w_v.data ), 0) 
         
-        if self.self_attention.in_proj_bias is not None:
-            b_q, b_k, b_v = self.self_attention.in_proj_bias.chunk(3)
-            b_q.data  = torch.mm(b_q.data.unsqueeze(0),projection_mat_dict["post"][f"self_attn.query"]).squeeze(0)
-            b_k.data  = torch.mm(b_k.data.unsqueeze(0),projection_mat_dict["post"][f"self_attn.key"]).squeeze(0)  
-            b_v.data  = torch.mm(b_v.data.unsqueeze(0),projection_mat_dict["post"][f"self_attn.value"]).squeeze(0) 
-            self.self_attention.in_proj_bias.data = torch.cat((b_q.data, b_k.data, b_v.data ), 0)
-        
-        self.self_attention.out_proj.weight.data = torch.mm(projection_mat_dict["post"][f"self_attn.out_proj"].transpose(0,1) , torch.mm(self.self_attention.out_proj.weight.data, projection_mat_dict["pre"][f"self_attn.out_proj"].transpose(0,1) )).view_as(w_v.data)
-        if self.self_attention.out_proj.bias is not None:
-            self.self_attention.out_proj.bias.data  = torch.mm(self.self_attention.out_proj.bias.data.unsqueeze(0),projection_mat_dict["post"][f"self_attn.out_proj"]).squeeze(0)
-        
+        self.self_attention.out_proj.weight.data = torch.mm(self.self_attention.out_proj.weight.data, projection_mat_dict[f"{block_key}.self_attn.out_proj"].transpose(0,1) ).view_as(w_v.data)
+        mlp_ind = 0
         for layer in self.mlp:
             if isinstance(layer, nn.Linear):
-                layer.weight.data = torch.mm(projection_mat_dict["post"][f"mlp.linear{mlp_ind}"].transpose(0,1) ,torch.mm(layer.weight.data.flatten(1), projection_mat_dict["pre"][f"mlp.linear{mlp_ind}"].transpose(0,1))).view_as(layer.weight.data)
-                if layer.bias is not None:
-                    layer.bias.data  = torch.mm(layer.bias.data.unsqueeze(0),projection_mat_dict["post"][f"mlp.linear{mlp_ind}"]).squeeze(0)
+                layer.weight.data = torch.mm(layer.weight.data.flatten(1), projection_mat_dict[f"{block_key}.mlp.linear{mlp_ind}"].transpose(0,1)).view_as(layer.weight.data)
                 mlp_ind+=1
         return
 
@@ -240,29 +346,54 @@ class Encoder(nn.Module):
         return self.ln(self.layers(self.dropout(input)))    
     
     def get_activations(self, input):      
-        act={"pre":OrderedDict(), "post":OrderedDict()}
+        act=OrderedDict()
         encoderblock_ind=0
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
         input = input + self.pos_embedding
         input = self.dropout(input)
         for layer in self.layers:
-            layer_acts, input = layer.get_activations(input)
-            for loc in layer_acts.keys():
-                for key in layer_acts[loc].keys():
-                    act[loc][f"encoderblock{encoderblock_ind}.{key}"] = layer_acts[loc][key]
-            encoderblock_ind+=1        
+            block_name = f"encoderblock{encoderblock_ind}"
+            encoderblock_ind+=1
+            layer_acts, input = layer.get_activations(input, block_name)
+            act.update(layer_acts)    
         return act, self.ln(input)
+    
+        
+    def get_svd_directions(self, input, max_samples=10000):      
+        U=OrderedDict()
+        S=OrderedDict()
+        encoderblock_ind=0
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+        input = input + self.pos_embedding
+        input = self.dropout(input)
+        for layer in self.layers:
+            block_name = f"encoderblock{encoderblock_ind}"
+            encoderblock_ind+=1
+            layer_u, layer_s, input = layer.get_svd_directions(input, block_name, max_samples)
+            U.update(layer_u)    
+            S.update(layer_s)    
+        return U, S, self.ln(input)
+
+    def get_scaled_projections(self, input, alpha, max_samples=10000):      
+        proj=OrderedDict()
+        encoderblock_ind=0
+        torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
+        input = input + self.pos_embedding
+        input = self.dropout(input)
+        for layer in self.layers:
+            block_name = f"encoderblock{encoderblock_ind}"
+            encoderblock_ind+=1
+            layer_proj, input = layer.get_scaled_projections(input, block_name, alpha, max_samples)
+            proj.update(layer_proj)    
+        return proj, self.ln(input)    
+
     
     def project_weights(self, projection_mat_dict):
         encoderblock_ind=0
         for layer in self.layers:
-            layer_proj_mat = {"pre":OrderedDict(), "post":OrderedDict()}
-            for loc in projection_mat_dict.keys():
-                for key in projection_mat_dict[loc].keys():
-                    if f"encoderblock{encoderblock_ind}." in key:
-                        layer_proj_mat[loc][".".join(key.split(".")[1:])] = projection_mat_dict[loc][key]
-            layer.project_weights(layer_proj_mat)
+            block_name = f"encoderblock{encoderblock_ind}"
             encoderblock_ind+=1
+            layer.project_weights(projection_mat_dict, block_name)
         return
 
 
@@ -413,8 +544,7 @@ class VisionTransformer(nn.Module):
         x = F.log_softmax(x, dim=1)
         return x
     
-    def get_activations(self, x):      
-        act={"pre":OrderedDict(), "post":OrderedDict()}
+    def get_activations(self, x, max_samples=10000):      
         conv_proj_ind=0
         heads_ind=0
         ### x = self._process_input(x)
@@ -427,20 +557,19 @@ class VisionTransformer(nn.Module):
 
         # x = self.conv_proj(x)
         if isinstance(self.conv_proj, nn.Conv2d):
-            act["pre"][f"conv_proj.conv{conv_proj_ind}"]=reshape_conv_input_activation(deepcopy(x.clone().detach()), self.conv_proj).cpu().numpy()
-            x = self.conv_proj(x)
-            act["post"][f"conv_proj.conv{conv_proj_ind}"]=deepcopy(x.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, x.shape[1]))
+            x, act  = forward_cache_activations(x, self.conv_proj, f"conv_proj.conv{conv_proj_ind}", max_samples)  
             conv_proj_ind+=1
         else:
+            act=OrderedDict()
             for layer in self.conv_proj:
                 if isinstance(layer, nn.Conv2d):
-                    act["pre"][f"conv_proj.conv{conv_proj_ind}"]=reshape_conv_input_activation(deepcopy(x.clone().detach()), layer).cpu().numpy()
-                    x = layer(x)
-                    act["post"][f"conv_proj.conv{conv_proj_ind}"]=deepcopy(x.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, x.shape[1]))
+                    layer_name = f"conv_proj.conv{conv_proj_ind}"
                     conv_proj_ind+=1
                 else:
-                    x = layer(x)
-
+                    layer_name = ""
+                x, layer_acts  = forward_cache_activations(x, layer, f"conv_proj.conv{conv_proj_ind}", max_samples)  
+                act.update(layer_acts)    
+                    
         x = x.reshape(n, self.hidden_dim, n_h * n_w)        
 
         # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
@@ -454,75 +583,181 @@ class VisionTransformer(nn.Module):
         x = torch.cat([batch_class_token, x], dim=1)
 
         encoder_activation, x = self.encoder.get_activations(x)
-
-        #### Update act with encoder activations.
-        for loc in encoder_activation.keys():
-            for key in encoder_activation[loc].keys():
-                act[loc][f"encoder.{key}"] = encoder_activation[loc][key]
+        act.update(encoder_activation)  
 
         # Classifier "token" as used by standard language architectures
         x = x[:, 0]
 
-        # x = self.heads(x)
-        if isinstance(self.heads, nn.Linear):        
-            act["pre"][f"heads.linear{heads_ind}"]=deepcopy(x.clone().detach().view(-1, x.shape[-1]).cpu().numpy())
-            x = self.conv_proj(x)
-            act["post"][f"heads.linear{heads_ind}"]=deepcopy(x.clone().detach().view(-1, x.shape[-1]).cpu().numpy())
+        if isinstance(self.heads, nn.Linear):    
+            x, layer_acts  = forward_cache_activations(x, self.heads, f"heads.linear{heads_ind}", max_samples)  
+            act.update(layer_acts)   
             heads_ind+=1
         else:
             for layer in self.heads:
                 if isinstance(layer, nn.Linear):
-                    act["pre"][f"heads.linear{heads_ind}"]=deepcopy(x.clone().detach().view(-1, x.shape[-1]).cpu().numpy())
-                    x = layer(x)
-                    act["post"][f"heads.linear{heads_ind}"]=deepcopy(x.clone().detach().view(-1, x.shape[-1]).cpu().numpy())
+                    layer_name = f"heads.linear{heads_ind}"
                     heads_ind+=1
                 else:
-                    x = layer(x)
+                    layer_name = ""
+                x, layer_acts  = forward_cache_activations(x, layer, layer_name, max_samples)  
+                act.update(layer_acts)  
         self.max_head_linear_layers = heads_ind
         return act
     
-    def project_weights(self, projection_mat_dict):
+
+    def get_svd_directions(self, x,  max_samples=10000):      
+        conv_proj_ind=0
+        heads_ind=0
+        ### x = self._process_input(x)
+        n, c, h, w = x.shape
+        p = self.patch_size
+        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
+        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
+        n_h = h // p
+        n_w = w // p
+
+        # x = self.conv_proj(x)
+        if isinstance(self.conv_proj, nn.Conv2d):
+            x, U, S  = forward_cache_svd(x, self.conv_proj, f"conv_proj.conv{conv_proj_ind}",  max_samples)  
+            conv_proj_ind+=1
+        else:
+            U=OrderedDict()
+            S=OrderedDict()
+            
+            for layer in self.conv_proj:
+                if isinstance(layer, nn.Conv2d):
+                    layer_name = f"conv_proj.conv{conv_proj_ind}"
+                    conv_proj_ind+=1
+                else:
+                    layer_name = ""
+                x, layer_u, layer_s  = forward_cache_svd(x, layer, f"conv_proj.conv{conv_proj_ind}",  max_samples)  
+                U.update(layer_u)    
+                S.update(layer_s)    
+                    
+        x = x.reshape(n, self.hidden_dim, n_h * n_w)        
+
+        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
+        # The self attention layer expects inputs in the format (N, S, E)
+        # where S is the source sequence length, N is the batch size, E is the
+        # embedding dimension
+        x = x.permute(0, 2, 1)
+        
+        # Expand the class token to the full batch
+        batch_class_token = self.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+
+        encoder_u, encoder_s, x = self.encoder.get_svd_directions(x, max_samples)
+        U.update(encoder_u)  
+        S.update(encoder_s)  
+        
+
+        # Classifier "token" as used by standard language architectures
+        x = x[:, 0]
+
+        if isinstance(self.heads, nn.Linear):    
+            x, layer_u, layer_s  = forward_cache_svd(x, self.heads, f"heads.linear{heads_ind}",  max_samples)  
+            U.update(layer_u)  
+            S.update(layer_s)   
+            heads_ind+=1
+        else:
+            for layer in self.heads:
+                if isinstance(layer, nn.Linear):
+                    layer_name = f"heads.linear{heads_ind}"
+                    heads_ind+=1
+                else:
+                    layer_name = ""
+                x, layer_u, layer_s  = forward_cache_svd(x, layer, layer_name,  max_samples)  
+                U.update(layer_u)  
+                S.update(layer_s)   
+        self.max_head_linear_layers = heads_ind
+        return U, S
+    
+    
+
+    def get_scaled_projections(self, x, alpha, max_samples=10000):      
+        conv_proj_ind=0
+        heads_ind=0
+        ### x = self._process_input(x)
+        n, c, h, w = x.shape
+        p = self.patch_size
+        torch._assert(h == self.image_size, f"Wrong image height! Expected {self.image_size} but got {h}!")
+        torch._assert(w == self.image_size, f"Wrong image width! Expected {self.image_size} but got {w}!")
+        n_h = h // p
+        n_w = w // p
+
+        # x = self.conv_proj(x)
+        if isinstance(self.conv_proj, nn.Conv2d):
+            x, proj  = forward_cache_projections(x, self.conv_proj, f"conv_proj.conv{conv_proj_ind}", alpha, max_samples)  
+            conv_proj_ind+=1
+        else:
+            proj=OrderedDict()
+            for layer in self.conv_proj:
+                if isinstance(layer, nn.Conv2d):
+                    layer_name = f"conv_proj.conv{conv_proj_ind}"
+                    conv_proj_ind+=1
+                else:
+                    layer_name = ""
+                x, layer_proj  = forward_cache_projections(x, layer, f"conv_proj.conv{conv_proj_ind}", alpha, max_samples)  
+                proj.update(layer_proj)    
+                    
+        x = x.reshape(n, self.hidden_dim, n_h * n_w)        
+
+        # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
+        # The self attention layer expects inputs in the format (N, S, E)
+        # where S is the source sequence length, N is the batch size, E is the
+        # embedding dimension
+        x = x.permute(0, 2, 1)
+        
+        # Expand the class token to the full batch
+        batch_class_token = self.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+
+        encoder_proj, x = self.encoder.get_scaled_projections(x, alpha, max_samples)
+        proj.update(encoder_proj)  
+
+        # Classifier "token" as used by standard language architectures
+        x = x[:, 0]
+
+        if isinstance(self.heads, nn.Linear):    
+            x, layer_proj  = forward_cache_projections(x, self.heads, f"heads.linear{heads_ind}", alpha, max_samples)  
+            proj.update(layer_proj)   
+            heads_ind+=1
+        else:
+            for layer in self.heads:
+                if isinstance(layer, nn.Linear):
+                    layer_name = f"heads.linear{heads_ind}"
+                    heads_ind+=1
+                else:
+                    layer_name = ""
+                x, layer_proj  = forward_cache_projections(x, layer, layer_name, alpha, max_samples)  
+                proj.update(layer_proj)  
+        self.max_head_linear_layers = heads_ind
+        return proj
+    
+    def project_weights(self, projection_mat_dict, proj_classifier=False):
         conv_proj_ind=0
         heads_ind=0
         if isinstance(self.conv_proj, nn.Conv2d):
-            self.conv_proj.weight.data = torch.mm(projection_mat_dict["post"][f"conv_proj.conv{conv_proj_ind}"].transpose(0,1) ,torch.mm(self.conv_proj.weight.data.flatten(1), projection_mat_dict["pre"][f"conv_proj.conv{conv_proj_ind}"].transpose(0,1))).view_as(self.conv_proj.weight.data)
-            if self.conv_proj.bias is not None:
-                self.conv_proj.bias.data  = torch.mm(self.conv_proj.bias.data.unsqueeze(0),projection_mat_dict["post"][f"conv_proj.conv{conv_proj_ind}"]).squeeze(0)
+            self.conv_proj.weight.data = torch.mm(self.conv_proj.weight.data.flatten(1), projection_mat_dict[f"conv_proj.conv{conv_proj_ind}"].transpose(0,1)).view_as(self.conv_proj.weight.data)
             conv_proj_ind+=1
         else:
             for layer in self.conv_proj:
                 if isinstance(layer, nn.Conv2d):
-                    layer.weight.data = torch.mm(projection_mat_dict["post"][f"conv_proj.conv{conv_proj_ind}"].transpose(0,1) ,torch.mm(layer.weight.data.flatten(1), projection_mat_dict["pre"][f"conv_proj.conv{conv_proj_ind}"].transpose(0,1))).view_as(layer.weight.data)
-                    if layer.bias is not None:
-                        layer.bias.data  = torch.mm(layer.bias.data.unsqueeze(0),projection_mat_dict["post"][f"conv_proj.conv{conv_proj_ind}"]).squeeze(0)
-                    conv_proj_ind+=1
-        
-        encoder_mat_dict = {"pre":OrderedDict(), "post":OrderedDict()}
-        for loc in projection_mat_dict.keys():
-            for key in projection_mat_dict[loc].keys():
-                if "encoder." in key:
-                    encoder_mat_dict[loc][".".join(key.split(".")[1:])] = projection_mat_dict[loc][key]
+                    layer.weight.data = torch.mm(layer.weight.data.flatten(1), projection_mat_dict[f"conv_proj.conv{conv_proj_ind}"].transpose(0,1)).view_as(layer.weight.data)
                     
-        self.encoder.project_weights(encoder_mat_dict)
+                    conv_proj_ind+=1
+    
+                    
+        self.encoder.project_weights(projection_mat_dict)
 
         if isinstance(self.heads, nn.Linear):
-            self.heads.weight.data  = torch.mm(self.heads.weight.data , projection_mat_dict["pre"][f"heads.linear{heads_ind}"].transpose(0,1) )
-            # self.heads.weight.data = torch.mm(projection_mat_dict["post"][f"heads.linear{heads_ind}"].transpose(0,1) ,torch.mm(self.heads.weight.data.flatten(1), projection_mat_dict["pre"][f"heads.linear{heads_ind}"].transpose(0,1))).view_as(self.conv_proj.weight.data)
-            # if self.heads.bias is not None:
-            #     self.heads.bias.data  = torch.mm(self.heads.bias.data.unsqueeze(0),projection_mat_dict["post"][f"heads.linear{heads_ind}"]).squeeze(0)
+            self.heads.weight.data  = torch.mm(self.heads.weight.data , projection_mat_dict[f"heads.linear{heads_ind}"].transpose(0,1) )
             heads_ind+=1
         else:
             for layer in self.heads:
                 if isinstance(layer, nn.Linear):
-                    if heads_ind == self.max_head_linear_layers-1:
-                        # LAST layer avoid output projections
-                        layer.weight.data  = torch.mm(layer.weight.data , projection_mat_dict["pre"][f"heads.linear{heads_ind}"].transpose(0,1) )
-                        heads_ind+=1
-                    else:
-                        layer.weight.data = torch.mm(projection_mat_dict["post"][f"heads.linear{heads_ind}"].transpose(0,1) ,torch.mm(layer.weight.data.flatten(1), projection_mat_dict["pre"][f"heads.linear{heads_ind}"].transpose(0,1))).view_as(layer.weight.data)
-                        if layer.bias is not None:
-                            layer.bias.data  = torch.mm(layer.bias.data.unsqueeze(0),projection_mat_dict["post"][f"heads.linear{heads_ind}"]).squeeze(0)
-                        heads_ind+=1
+                    layer.weight.data = torch.mm(layer.weight.data.flatten(1), projection_mat_dict[f"heads.linear{heads_ind}"].transpose(0,1)).view_as(layer.weight.data)
+                    heads_ind+=1
         return 
     
 

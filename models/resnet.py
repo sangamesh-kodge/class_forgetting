@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import OrderedDict
 from copy import deepcopy
-from .model_utils import reshape_conv_input_activation
+from .model_utils import reshape_conv_input_activation, forward_cache_activations, forward_cache_projections, forward_cache_svd
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -33,40 +33,56 @@ class BasicBlock(nn.Module):
         out = F.relu(out)
         return out
 
-    def get_activations(self, x):
+    def get_activations(self, x, block_key, max_samples=10000):
         identity = x
-        act={"pre":OrderedDict(), "post":OrderedDict()}
-        act["pre"]["conv1"] =reshape_conv_input_activation(deepcopy(x.clone().detach()), self.conv1).cpu().numpy()
-        out = self.conv1(x)
-        act["post"]["conv1"] =deepcopy(out.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, out.shape[1]))
+        out, act = forward_cache_activations(x, self.conv1, f"{block_key}.conv1", max_samples)
         out = F.relu(self.bn1(out))
-        act["pre"]["conv2"] =reshape_conv_input_activation(deepcopy(out.clone().detach()), self.conv2).cpu().numpy()
-        out = self.conv2(out)
-        act["post"]["conv2"] =deepcopy(out.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, out.shape[1]))
+        out, layer_acts = forward_cache_activations(out, self.conv2, f"{block_key}.conv2", max_samples)
+        act.update(layer_acts)           
         out = self.bn2(out) 
         for layer in self.downsample: 
-            if isinstance(layer, nn.Conv2d):
-                act["pre"]["downsample"] =reshape_conv_input_activation(deepcopy(identity.clone().detach()), layer).cpu().numpy()
-                identity =  layer(identity)
-                act["post"]["downsample"] =deepcopy(identity.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, identity.shape[1]))
-            else:
-                identity =  layer(identity)
+            identity, layer_acts = forward_cache_activations(identity, layer, f"{block_key}.downsample", max_samples)
+            act.update(layer_acts)   
         out +=identity
         out = F.relu(out)
         return act, out
+
+    def get_svd_directions(self, x, block_key, max_samples=10000):
+        identity = x
+        out, U, S = forward_cache_svd(x, self.conv1, f"{block_key}.conv1", max_samples)
+        out = F.relu(self.bn1(out))
+        out, layer_u, layer_s = forward_cache_svd(out, self.conv2, f"{block_key}.conv2", max_samples)
+        U.update(layer_u)
+        S.update(layer_s)
+        out = self.bn2(out) 
+        for layer in self.downsample: 
+            identity,  layer_u, layer_s  = forward_cache_svd(identity, layer, f"{block_key}.downsample", max_samples)
+            U.update(layer_u)
+            S.update(layer_s)
+        out +=identity
+        out = F.relu(out)
+        return U, S, out
+
+    def get_scaled_projections(self, x, block_key, alpha, max_samples=10000):
+        identity = x
+        out, proj = forward_cache_projections(x, self.conv1, f"{block_key}.conv1", alpha, max_samples)
+        out = F.relu(self.bn1(out))
+        out, layer_acts = forward_cache_projections(out, self.conv2, f"{block_key}.conv2", alpha, max_samples)
+        proj.update(layer_acts)           
+        out = self.bn2(out) 
+        for layer in self.downsample: 
+            identity, layer_acts = forward_cache_projections(identity, layer, f"{block_key}.downsample", alpha, max_samples)
+            proj.update(layer_acts)   
+        out +=identity
+        out = F.relu(out)
+        return proj, out
     
-    def project_weights(self, projection_mat_dict):
-        self.conv1.weight.data = torch.mm(projection_mat_dict["post"]["conv1"].transpose(0,1) ,torch.mm(self.conv1.weight.data.flatten(1), projection_mat_dict["pre"]["conv1"].transpose(0,1))).view_as(self.conv1.weight.data)
-        if self.conv1.bias is not None:
-            self.conv1.bias.data = torch.mm( self.conv1.bias.data.unsqueeze(0), projection_mat_dict["post"]["conv1"]).squeeze(0)
-        self.conv2.weight.data = torch.mm(projection_mat_dict["post"]["conv2"].transpose(0,1) ,torch.mm(self.conv2.weight.data.flatten(1), projection_mat_dict["pre"]["conv2"].transpose(0,1))).view_as(self.conv2.weight.data)
-        if self.conv2.bias is not None:
-            self.conv2.bias.data = torch.mm( self.conv2.bias.data.unsqueeze(0), projection_mat_dict["post"]["conv2"]).squeeze(0)
+    def project_weights(self, projection_mat_dict, block_key):
+        self.conv1.weight.data = torch.mm(self.conv1.weight.data.flatten(1), projection_mat_dict[f"{block_key}.conv1"].transpose(0,1)).view_as(self.conv1.weight.data)
+        self.conv2.weight.data = torch.mm(self.conv2.weight.data.flatten(1), projection_mat_dict[f"{block_key}.conv2"].transpose(0,1)).view_as(self.conv2.weight.data)
         for layer in self.downsample:
             if isinstance(layer, nn.Conv2d):
-                layer.weight.data = torch.mm(projection_mat_dict["post"]["downsample"].transpose(0,1) ,torch.mm(layer.weight.data.flatten(1), projection_mat_dict["pre"]["downsample"].transpose(0,1))).view_as(layer.weight.data)
-                if layer.bias is not None:
-                    layer.bias.data = torch.mm( layer.bias.data.unsqueeze(0), projection_mat_dict["post"]["downsample"]).squeeze(0)
+                layer.weight.data = torch.mm(layer.weight.data.flatten(1), projection_mat_dict[f"{block_key}.downsample"].transpose(0,1)).view_as(layer.weight.data)
                 break
             else:
                 continue
@@ -102,55 +118,76 @@ class Bottleneck(nn.Module):
         out = F.relu(out)
         return out
 
-    def get_activations(self, x):
+    def get_activations(self, x, block_key, max_samples=10000):
         identity = x
-        act={"pre":OrderedDict(), "post":OrderedDict()}
-        act["pre"]["conv1"] =reshape_conv_input_activation(deepcopy(x.clone().detach()), self.conv1).cpu().numpy()
-        out = self.conv1(x)
-        act["post"]["conv1"] =deepcopy(out.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, out.shape[1]))
+        out, act = forward_cache_activations(x, self.conv1, f"{block_key}.conv1", max_samples)
         out = F.relu(self.bn1(out))
-        act["pre"]["conv2"] =reshape_conv_input_activation(deepcopy(out.clone().detach()), self.conv2).cpu().numpy()
-        out = self.conv2(out)
-        act["post"]["conv2"] =deepcopy(out.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, out.shape[1]))
+        out, layer_acts = forward_cache_activations(out, self.conv2, f"{block_key}.conv2", max_samples)
+        act.update(layer_acts)        
         out = F.relu(self.bn2(out) )
-        act["pre"]["conv3"] =reshape_conv_input_activation(deepcopy(out.clone().detach()), self.conv3).cpu().numpy()
-        out = self.conv3(out)
-        act["post"]["conv3"] =deepcopy(out.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, out.shape[1]))
+        out, layer_acts = forward_cache_activations(out, self.conv3, f"{block_key}.conv2", max_samples)
+        act.update(layer_acts)   
         out = self.bn3(out)
         for layer in self.downsample: 
-            if isinstance(layer, nn.Conv2d):
-                act["pre"]["downsample"] =reshape_conv_input_activation(deepcopy(identity.clone().detach()), layer).cpu().numpy()
-                identity =  layer(identity)
-                act["post"]["downsample"] =deepcopy(identity.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, identity.shape[1]))
-            else:
-                identity =  layer(identity)
+            identity, layer_acts = forward_cache_activations(identity, layer, f"{block_key}.downsample", max_samples)
+            act.update(layer_acts)   
         out +=identity
         out = F.relu(out)
         return act, out
 
-    def project_weights(self, projection_mat_dict):
-        self.conv1.weight.data = torch.mm(projection_mat_dict["post"]["conv1"].transpose(0,1) ,torch.mm(self.conv1.weight.data.flatten(1), projection_mat_dict["pre"]["conv1"].transpose(0,1))).view_as(self.conv1.weight.data)
-        if self.conv1.bias is not None:
-            self.conv1.bias.data = torch.mm( self.conv1.bias.data.unsqueeze(0), projection_mat_dict["post"]["conv1"]).squeeze(0)
-        self.conv2.weight.data = torch.mm(projection_mat_dict["post"]["conv2"].transpose(0,1) ,torch.mm(self.conv2.weight.data.flatten(1), projection_mat_dict["pre"]["conv2"].transpose(0,1))).view_as(self.conv2.weight.data)
-        if self.conv2.bias is not None:
-            self.conv2.bias.data = torch.mm( self.conv2.bias.data.unsqueeze(0), projection_mat_dict["post"]["conv2"]).squeeze(0)
-        self.conv3.weight.data = torch.mm(projection_mat_dict["post"]["conv3"].transpose(0,1) ,torch.mm(self.conv3.weight.data.flatten(1), projection_mat_dict["pre"]["conv3"].transpose(0,1))).view_as(self.conv3.weight.data)
-        if self.conv3.bias is not None:
-            self.conv3.bias.data = torch.mm( self.conv3.bias.data.unsqueeze(0), projection_mat_dict["post"]["conv3"]).squeeze(0)
+
+
+    def get_activations(self, x, block_key, max_samples=10000):
+        identity = x
+        out, U, S = forward_cache_svd(x, self.conv1, f"{block_key}.conv1", max_samples)
+        out = F.relu(self.bn1(out))
+        out, layer_u, layer_s = forward_cache_activations(out, self.conv2, f"{block_key}.conv2", max_samples)
+        U.update(layer_u)        
+        S.update(layer_s)
+        out = F.relu(self.bn2(out) )
+        out, layer_u, layer_s = forward_cache_activations(out, self.conv3, f"{block_key}.conv2", max_samples)
+        U.update(layer_u)        
+        S.update(layer_s)
+        out = self.bn3(out)
+        for layer in self.downsample: 
+            identity, layer_u, layer_s = forward_cache_activations(identity, layer, f"{block_key}.downsample", max_samples)
+            U.update(layer_u)        
+            S.update(layer_s)  
+        out +=identity
+        out = F.relu(out)
+        return U, S, out
+    def get_scaled_projections(self, x, block_key, alpha, max_samples=10000):
+        identity = x
+        out, proj = forward_cache_projections(x, self.conv1, f"{block_key}.conv1", max_samples)
+        out = F.relu(self.bn1(out))
+        out, layer_acts = forward_cache_projections(out, self.conv2, f"{block_key}.conv2", max_samples)
+        proj.update(layer_acts)        
+        out = F.relu(self.bn2(out) )
+        out, layer_acts = forward_cache_projections(out, self.conv3, f"{block_key}.conv2", max_samples)
+        proj.update(layer_acts)   
+        out = self.bn3(out)
+        for layer in self.downsample: 
+            identity, layer_acts = forward_cache_projections(identity, layer, f"{block_key}.downsample", max_samples)
+            proj.update(layer_acts)   
+        out +=identity
+        out = F.relu(out)
+        return proj, out
+
+    def project_weights(self, projection_mat_dict, block_key):
+        self.conv1.weight.data = torch.mm(self.conv1.weight.data.flatten(1), projection_mat_dict[f"{block_key}.conv1"].transpose(0,1)).view_as(self.conv1.weight.data)
+        self.conv2.weight.data = torch.mm(self.conv2.weight.data.flatten(1), projection_mat_dict[f"{block_key}.conv2"].transpose(0,1)).view_as(self.conv2.weight.data)
+        self.conv3.weight.data = torch.mm(self.conv3.weight.data.flatten(1), projection_mat_dict[f"{block_key}.conv3"].transpose(0,1)).view_as(self.conv3.weight.data)
         if self.downsample:
             for layer in self.downsample:
                 if isinstance(layer, nn.Conv2d):
-                    layer.weight.data = torch.mm(projection_mat_dict["post"]["downsample"].transpose(0,1) ,torch.mm(layer.weight.data.flatten(1), projection_mat_dict["pre"]["downsample"].transpose(0,1))).view_as(layer.weight.data)
-                    if layer.bias is not None:
-                        layer.bias.data = torch.mm( layer.bias.data.unsqueeze(0), projection_mat_dict["post"]["downsample"]).squeeze(0)
+                    layer.weight.data = torch.mm(layer.weight.data.flatten(1), projection_mat_dict[f"{block_key}.downsample"].transpose(0,1)).view_as(layer.weight.data)
                     break
                 else:
                     continue
         
         
 class ResNet_cifar(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10):
+    def __init__(self, block, num_blocks, num_classes=10, do_log_softmax=True):
         super(ResNet_cifar, self).__init__()
         self.in_planes = 64
 
@@ -162,6 +199,7 @@ class ResNet_cifar(nn.Module):
         self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
         self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
         self.fc = nn.Linear(512*block.expansion, num_classes)
+        self.do_log_softmax = do_log_softmax
 
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1]*(num_blocks-1)
@@ -180,59 +218,83 @@ class ResNet_cifar(nn.Module):
         out = F.avg_pool2d(out, 4)
         out = out.view(out.size(0), -1)
         out = self.fc(out)
-        out =  F.log_softmax(out, dim=1)
+        if self.do_log_softmax:
+            out =  F.log_softmax(out, dim=1)
         return out
     
-    def get_activations(self, x):      
-        act={"pre":OrderedDict(), "post":OrderedDict()}
+    def get_activations(self, x, max_samples=10000):      
         block_ind=0
         fc_ind = 0
-        act["pre"][f"conv1"]=reshape_conv_input_activation(deepcopy(x.clone().detach()), self.conv1).cpu().numpy()
-        out = self.conv1(x)
-        act["post"][f"conv1"]=deepcopy(out.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, out.shape[1]))
+        out, act = forward_cache_activations(x, self.conv1, "conv1", max_samples)
         out = F.relu(self.bn1(out))
         for group in [self.layer1, self.layer2, self.layer3, self.layer4]:
-            for block in group:
-                block_act, out = block.get_activations(out)
-                for loc in block_act.keys():
-                    for name in block_act[loc].keys():
-                        act[loc][f"block{block_ind}.{name}"] = block_act[loc][name]
+            for block in group:                
+                block_acts, out = block.get_activations(out, f"block{block_ind}", max_samples)
+                act.update(block_acts)  
                 block_ind+=1
         out = F.avg_pool2d(out, 4)
         out = out.view(out.size(0), -1)
-        act["pre"][f"fc{fc_ind}"]=deepcopy(out.clone().detach().cpu().numpy())
-        out = self.fc(out)
-        act["post"][f"fc{fc_ind}"]=deepcopy(out.clone().detach().cpu().numpy())        
+        out, block_acts = forward_cache_activations(out, self.fc, f"fc{fc_ind}", max_samples)
+        act.update(block_acts)  
         return act
+
     
-    def project_weights(self, projection_mat_dict):
+    
+    def get_svd_directions(self, x, max_samples=10000):      
         block_ind=0
         fc_ind = 0
-        self.conv1.weight.data = torch.mm(projection_mat_dict["post"]["conv1"].transpose(0,1) ,torch.mm(self.conv1.weight.data.flatten(1), projection_mat_dict["pre"]["conv1"].transpose(0,1))).view_as(self.conv1.weight.data)
-        if self.conv1.bias is not None:
-            self.conv1.bias.data  = torch.mm(self.conv1.bias.data.unsqueeze(0),projection_mat_dict["post"]["conv1"]).squeeze(0)
+        out, U, S = forward_cache_svd(x, self.conv1, "conv1", max_samples)
+        out = F.relu(self.bn1(out))
+        for group in [self.layer1, self.layer2, self.layer3, self.layer4]:
+            for block in group:                
+                block_u, block_s, out  = block.get_svd_directions(out, f"block{block_ind}", max_samples)
+                U.update(block_u)  
+                S.update(block_s)
+                block_ind+=1
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
+        out, layer_u, layer_s = forward_cache_svd(out, self.fc, f"fc{fc_ind}", max_samples)
+        U.update(layer_u)  
+        S.update(layer_s)
+        return U,S
+    def get_scaled_projections(self, x, alpha, max_samples=10000):      
+        block_ind=0
+        fc_ind = 0
+        out, proj = forward_cache_projections(x, self.conv1, "conv1", alpha, max_samples)
+        out = F.relu(self.bn1(out))
+        for group in [self.layer1, self.layer2, self.layer3, self.layer4]:
+            for block in group:                
+                block_acts, out = block.get_scaled_projections(out, f"block{block_ind}", alpha, max_samples)
+                proj.update(block_acts)  
+                block_ind+=1
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
+        out, block_acts = forward_cache_projections(out, self.fc, f"fc{fc_ind}", alpha, max_samples)
+        proj.update(block_acts)  
+        return proj
+
+    
+    def project_weights(self, projection_mat_dict, proj_classifier=False):
+        block_ind=0
+        fc_ind = 0
+        self.conv1.weight.data = torch.mm(self.conv1.weight.data.flatten(1), projection_mat_dict["conv1"].transpose(0,1)).view_as(self.conv1.weight.data)
+        
         for group in [self.layer1, self.layer2, self.layer3, self.layer4]:
             for block in group:
-                block_name = f"block{block_ind}"
-                block_proj_mat_dict = {"pre":OrderedDict(), "post":OrderedDict()}
-                for loc in projection_mat_dict.keys():
-                    for act in projection_mat_dict[loc].keys():
-                        if block_name == act.split(".")[0]:
-                            block_proj_mat_dict[loc][".".join(act.split(".")[1:])] = projection_mat_dict[loc][act]
-                block.project_weights(block_proj_mat_dict)
-                block_ind+=1                
-        self.fc.weight.data = torch.mm(self.fc.weight.data, projection_mat_dict["pre"][f"fc{fc_ind}"].transpose(0,1) )
-                    
-        # self.fc.weight.data = torch.mm(projection_mat_dict["post"][f"fc{fc_ind}"].transpose(0,1) ,torch.mm(self.fc.weight.data, projection_mat_dict["pre"][f"fc{fc_ind}"].transpose(0,1) ))
-        # if self.fc.bias is not None:
-        #     self.fc.bias.data = torch.mm(self.fc.bias.data.unsqueeze(0),projection_mat_dict["post"][f"fc{fc_ind}"]).squeeze(0)
+                block_key = f"block{block_ind}"
+                block.project_weights(projection_mat_dict, block_key)
+                block_ind+=1       
+        if not proj_classifier:
+            self.fc.weight.data = torch.mm(self.fc.weight.data, projection_mat_dict[f"fc{fc_ind}"].transpose(0,1) )
+        else:                    
+            self.fc.weight.data = torch.mm(self.fc.weight.data, projection_mat_dict[f"fc{fc_ind}"].transpose(0,1) )
         return 
     
 
     
 
 class ResNet_imagenet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10):
+    def __init__(self, block, num_blocks, num_classes=10, do_log_softmax=True):
         super(ResNet_imagenet, self).__init__()
         self.in_planes = 64
 
@@ -246,7 +308,7 @@ class ResNet_imagenet(nn.Module):
         self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512*block.expansion, num_classes)
-
+        self.do_log_softmax=do_log_softmax
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1]*(num_blocks-1)
         layers = []
@@ -264,99 +326,121 @@ class ResNet_imagenet(nn.Module):
         out = self.avgpool(out)
         out = out.view(out.size(0), -1)
         out = self.fc(out)
-        out =  F.log_softmax(out, dim=1)
+
+        if self.do_log_softmax:
+            out =  F.log_softmax(out, dim=1)
         return out
-    
-    def get_activations(self, x):      
-        act={"pre":OrderedDict(), "post":OrderedDict()}
+    def get_activations(self, x, max_samples=10000):      
         block_ind=0
         fc_ind = 0
-        act["pre"][f"conv1"]=reshape_conv_input_activation(deepcopy(x.clone().detach()), self.conv1).cpu().numpy()
-        out = self.conv1(x)
-        act["post"][f"conv1"]=deepcopy(out.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, out.shape[1]))
+        out, act = forward_cache_activations(x, self.conv1, "conv1", max_samples)
         out = self.maxpool(F.relu(self.bn1(out)))
         for group in [self.layer1, self.layer2, self.layer3, self.layer4]:
-            for block in group:
-                block_act, out = block.get_activations(out)
-                for loc in block_act.keys():
-                    for name in block_act[loc].keys():
-                        act[loc][f"block{block_ind}.{name}"] = block_act[loc][name]
+            for block in group:                
+                block_acts, out = block.get_activations(out, f"block{block_ind}", max_samples)
+                act.update(block_acts)  
                 block_ind+=1
         out = self.avgpool(out)
         out = out.view(out.size(0), -1)
-        act["pre"][f"fc{fc_ind}"]=deepcopy(out.clone().detach().cpu().numpy())
-        out = self.fc(out)
-        act["post"][f"fc{fc_ind}"]=deepcopy(out.clone().detach().cpu().numpy())        
+        out, block_acts = forward_cache_activations(out, self.fc, f"fc{fc_ind}", max_samples)
+        act.update(block_acts)  
         return act
     
-    def project_weights(self, projection_mat_dict):
-        # ind=1
+    def get_svd_directions(self, x, max_samples=10000):   
         block_ind=0
         fc_ind = 0
-        self.conv1.weight.data = torch.mm(projection_mat_dict["post"]["conv1"].transpose(0,1),torch.mm(self.conv1.weight.data.flatten(1), projection_mat_dict["pre"]["conv1"].transpose(0,1))).view_as(self.conv1.weight.data)
-        if self.conv1.bias is not None:
-            self.conv1.bias.data  = torch.mm(self.conv1.bias.data.unsqueeze(0),projection_mat_dict["post"]["conv1"]).squeeze(0)
+        out, U, S = forward_cache_svd(x, self.conv1, "conv1", max_samples)
+        out = self.maxpool(F.relu(self.bn1(out)))
+        for group in [self.layer1, self.layer2, self.layer3, self.layer4]:
+            for block in group:                
+                block_u, block_s, out = block.get_svd_directions(out, f"block{block_ind}", max_samples)
+                U.update(block_u)  
+                S.update(block_s)  
+                block_ind+=1
+        out = self.avgpool(out)
+        out = out.view(out.size(0), -1)
+        out, layer_u, layer_s = forward_cache_svd(out, self.fc, f"fc{fc_ind}", max_samples)
+        U.update(layer_u)  
+        S.update(layer_s)  
+        return U, S
+
+    def get_scaled_projections(self, x, max_samples=10000):   
+        block_ind=0
+        fc_ind = 0
+        out, proj = forward_cache_projections(x, self.conv1, "conv1", alpha, max_samples)
+        out = self.maxpool(F.relu(self.bn1(out)))
+        for group in [self.layer1, self.layer2, self.layer3, self.layer4]:
+            for block in group:                
+                block_acts, out = block.get_scaled_projections(out, f"block{block_ind}", alpha, max_samples)
+                proj.update(block_acts)  
+                block_ind+=1
+        out = self.avgpool(out)
+        out = out.view(out.size(0), -1)
+        out, block_acts = forward_cache_activations(out, self.fc, f"fc{fc_ind}", alpha, max_samples)
+        proj.update(block_acts)  
+        return proj
+    
+    def project_weights(self, projection_mat_dict, proj_classifier=False):
+        block_ind=0
+        fc_ind = 0
+        self.conv1.weight.data = torch.mm(self.conv1.weight.data.flatten(1), projection_mat_dict["conv1"].transpose(0,1)).view_as(self.conv1.weight.data)
         for group in [self.layer1, self.layer2, self.layer3, self.layer4]:
             for block in group:
-                block_name = f"block{block_ind}"
-                block_proj_mat_dict = {"pre":OrderedDict(), "post":OrderedDict()}
-                for loc in projection_mat_dict.keys():
-                    for act in projection_mat_dict[loc].keys():
-                        if block_name == act.split(".")[0]:
-                            block_proj_mat_dict[loc][".".join(act.split(".")[1:])] = projection_mat_dict[loc][act]
-                block.project_weights(block_proj_mat_dict)
-                block_ind+=1                
-                    
-        self.fc.weight.data = torch.mm(self.fc.weight.data, projection_mat_dict["pre"][f"fc{fc_ind}"].transpose(0,1) )
-                    
-        # self.fc.weight.data = torch.mm(projection_mat_dict["post"][f"fc{fc_ind}"].transpose(0,1) ,torch.mm(self.fc.weight.data, projection_mat_dict["pre"][f"fc{fc_ind}"].transpose(0,1) ))
-        # if self.fc.bias is not None:
-        #     self.fc.bias.data = torch.mm(self.fc.bias.data.unsqueeze(0),projection_mat_dict["post"][f"fc{fc_ind}"]).squeeze(0)
+                block_key = f"block{block_ind}"
+                block.project_weights(projection_mat_dict, block_key)
+                block_ind+=1        
+        if not proj_classifier:
+            self.fc.weight.data = torch.mm(self.fc.weight.data, projection_mat_dict[f"fc{fc_ind}"].transpose(0,1) )
+        else:                    
+            self.fc.weight.data = torch.mm(self.fc.weight.data, projection_mat_dict[f"fc{fc_ind}"].transpose(0,1) )
+            
         return 
-def ResNet18(num_classes=10, dataset = "imagenet"):
-    if dataset.lower() == "imagenet" or dataset.lower() == "imagenette":
+           
+    
+def ResNet18(num_classes=1000, dataset = "imagenet", do_log_softmax=True):
+    if "imagenet" in dataset.lower()  or  "vggface" in dataset.lower():
         ResNet = ResNet_imagenet
-    elif dataset.lower() == "cifar10" or dataset.lower() == "cifar100":
+    elif "cifar" in dataset.lower():
         ResNet = ResNet_cifar
     else:
         raise ValueError
-    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
+    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, do_log_softmax=do_log_softmax)
 
 
-def ResNet34(num_classes=10, dataset = "imagenet"):
-    if dataset.lower() == "imagenet" or dataset.lower() == "imagenette":
+def ResNet34(num_classes=1000, dataset = "imagenet"):
+    if "imagenet" in dataset.lower()  or  "vggface" in dataset.lower():
         ResNet = ResNet_imagenet
-    elif dataset.lower() == "cifar10" or dataset.lower() == "cifar100":
+    elif "cifar" in dataset.lower():
         ResNet = ResNet_cifar
     else:
         raise ValueError
     return ResNet(BasicBlock, [3, 4, 6, 3], num_classes=num_classes)
 
 
-def ResNet50(num_classes=10, dataset = "imagenet"):
-    if dataset.lower() == "imagenet" or dataset.lower() == "imagenette":
+def ResNet50(num_classes=1000, dataset = "imagenet"):
+    if "imagenet" in dataset.lower()  or  "vggface" in dataset.lower():
         ResNet = ResNet_imagenet
-    elif dataset.lower() == "cifar10" or dataset.lower() == "cifar100":
+    elif "cifar" in dataset.lower():
         ResNet = ResNet_cifar
     else:
         raise ValueError
     return ResNet(Bottleneck, [3, 4, 6, 3], num_classes=num_classes)
 
 
-def ResNet101(num_classes=10, dataset = "imagenet"):
-    if dataset.lower() == "imagenet" or dataset.lower() == "imagenette":
+def ResNet101(num_classes=1000, dataset = "imagenet"):
+    if "imagenet" in dataset.lower()  or  "vggface" in dataset.lower():
         ResNet = ResNet_imagenet
-    elif dataset.lower() == "cifar10" or dataset.lower() == "cifar100":
+    elif "cifar" in dataset.lower():
         ResNet = ResNet_cifar
     else:
         raise ValueError
     return ResNet(Bottleneck, [3, 4, 23, 3], num_classes=num_classes)
 
 
-def ResNet152(num_classes=10, dataset = "imagenet"):
-    if dataset.lower() == "imagenet" or dataset.lower() == "imagenette":
+def ResNet152(num_classes=1000, dataset = "imagenet"):
+    if "imagenet" in dataset.lower()  or  "vggface" in dataset.lower():
         ResNet = ResNet_imagenet
-    elif dataset.lower() == "cifar10" or dataset.lower() == "cifar100":
+    elif "cifar" in dataset.lower():
         ResNet = ResNet_cifar
     else:
         raise ValueError

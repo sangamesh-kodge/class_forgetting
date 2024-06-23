@@ -9,7 +9,7 @@ import torch
 from collections import OrderedDict
 from copy import deepcopy
 import torch.nn.functional as F
-from .model_utils import reshape_conv_input_activation
+from .model_utils import reshape_conv_input_activation, forward_cache_activations, forward_cache_projections, forward_cache_svd
 __all__ = [
     'VGG', 'vgg11', 'vgg11_bn', 'vgg13', 'vgg13_bn', 'vgg16', 'vgg16_bn',
     'vgg19_bn', 'vgg19',
@@ -20,10 +20,10 @@ class VGG(nn.Module):
     '''
     VGG model 
     '''
-    def __init__(self, features, num_classes = 10, dataset="imagenet", dropout: float = 0.5):
+    def __init__(self, features, num_classes = 10, dataset="imagenet", do_log_softmax=True,dropout: float = 0.5):
         super(VGG, self).__init__()
         self.features = features
-        if "imagenet" in dataset:
+        if "imagenet" in dataset or  "vggface" in dataset:
             self.classifier = nn.Sequential(
                 nn.Linear(512*7*7, 4096),
                 nn.ReLU(True),
@@ -43,6 +43,7 @@ class VGG(nn.Module):
                 nn.Dropout(p=dropout),
                 nn.Linear(512, num_classes),
             )
+        self.do_log_softmax = do_log_softmax
          # Initialize weights
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -55,58 +56,73 @@ class VGG(nn.Module):
         x = self.features(x)
         x = x.view(x.size(0), -1)
         x = self.classifier(x)
-        x =  F.log_softmax(x, dim=1)
+        if self.do_log_softmax:
+            x =  F.log_softmax(x, dim=1)
         return x
     
-    def get_activations(self, x):
-        act={"pre":OrderedDict(), "post":OrderedDict()}
-        layer_ind = 0
-        for layer in self.features:
-            if isinstance(layer, nn.Conv2d):
-                act["pre"][f"conv{layer_ind}"]=reshape_conv_input_activation(deepcopy(x.clone().detach()), layer).cpu().numpy()
-            elif isinstance(layer, nn.Linear):
-                act["pre"][f"fc{layer_ind}"]=deepcopy(x.clone().detach().cpu().numpy())
-            x = layer(x)
-            if isinstance(layer, nn.Conv2d):
-                act["post"][f"conv{layer_ind}"]=deepcopy(x.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, x.shape[1]))
-                layer_ind+=1
-            elif isinstance(layer, nn.Linear):
-                act["post"][f"fc{layer_ind}"]=deepcopy(x.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, x.shape[1]))
-                layer_ind+=1 
-        x = x.view(x.size(0), -1)
-        for layer in self.classifier:
-            if isinstance(layer, nn.Conv2d):
-                act["pre"][f"conv{layer_ind}"]=reshape_conv_input_activation(deepcopy(x.clone().detach()), layer).cpu().numpy()
-            elif isinstance(layer, nn.Linear):
-                act["pre"][f"fc{layer_ind}"]=deepcopy(x.clone().detach().cpu().numpy())
-            x = layer(x)
-            if isinstance(layer, nn.Conv2d):
-                act["post"][f"conv{layer_ind}"]=deepcopy(x.permute(0,2,3,1).clone().detach().cpu().numpy().reshape(-1, x.shape[1]))
-                layer_ind+=1
-            elif isinstance(layer, nn.Linear):
-                act["post"][f"fc{layer_ind}"]= deepcopy(x.clone().detach().cpu().numpy()) 
-                layer_ind+=1 
-        self.num_layer = layer_ind
-        return act
-    
-    def project_weights(self, projection_mat_dict):
+    def get_activations(self, x, max_samples=10000):
+        act=OrderedDict()  #{"pre":OrderedDict(), "post":OrderedDict()}
         layer_ind = 0
         for layers in [self.features, self.classifier]:
             for layer in layers:
-                if isinstance(layer, nn.Conv2d):
-                    layer.weight.data = torch.mm( projection_mat_dict["post"][f"conv{layer_ind}"].transpose(0,1),torch.mm(layer.weight.data.flatten(1), projection_mat_dict["pre"][f"conv{layer_ind}"].transpose(0,1)) ).view_as(layer.weight.data)
-                    if layer.bias is not None:
-                        layer.bias.data = torch.mm(layer.bias.data.unsqueeze(0), projection_mat_dict["post"][f"conv{layer_ind}"]).squeeze(0)
+                if isinstance(layer, nn.Conv2d): 
+                    layer_key = f"conv{layer_ind}"
+                    layer_ind+=1 
+                elif  isinstance(layer, nn.Linear):
+                    layer_key = f"fc{layer_ind}"
+                    layer_ind+=1 
+                x, layer_acts  = forward_cache_activations(x, layer, layer_key, max_samples)  
+                act.update(layer_acts)  
+            x = x.view(x.size(0), -1) 
+        self.num_layer = layer_ind
+        return act
+    
+    def get_svd_directions(self, x, max_samples=10000):
+        U = OrderedDict()  #{"pre":OrderedDict(), "post":OrderedDict()}
+        S = OrderedDict()  #{"pre":OrderedDict(), "post":OrderedDict()}
+        layer_ind = 0
+        for layers in [self.features, self.classifier]:
+            for layer in layers:
+                if isinstance(layer, nn.Conv2d): 
+                    layer_key = f"conv{layer_ind}"
+                    layer_ind+=1 
+                elif  isinstance(layer, nn.Linear):
+                    layer_key = f"fc{layer_ind}"
+                    layer_ind+=1 
+                x, layer_u, layer_s  = forward_cache_svd(x, layer, layer_key, max_samples)  
+                U.update(layer_u)  
+                S.update(layer_s)  
+            x = x.view(x.size(0), -1) 
+        self.num_layer = layer_ind
+        return U, S
+
+    def get_scaled_projections(self, x, alpha, max_samples=10000):
+        Proj =OrderedDict()  #{"pre":OrderedDict(), "post":OrderedDict()}
+        layer_ind = 0
+        for layers in [self.features, self.classifier]:
+            for layer in layers:
+                if isinstance(layer, nn.Conv2d): 
+                    layer_key = f"conv{layer_ind}"
+                    layer_ind+=1 
+                elif  isinstance(layer, nn.Linear):
+                    layer_key = f"fc{layer_ind}"
+                    layer_ind+=1 
+                    
+                x, layer_proj  = forward_cache_projections(x, layer, layer_key, alpha, max_samples)  
+                Proj.update(layer_proj)  
+            x = x.view(x.size(0), -1) 
+        self.num_layer = layer_ind
+        return Proj
+
+    def project_weights(self, projection_mat_dict, proj_classifier=False):
+        layer_ind = 0
+        for layers in [self.features, self.classifier]:
+            for layer in layers:
+                if isinstance(layer, nn.Conv2d)  :
+                    layer.weight.data = torch.mm(layer.weight.data.flatten(1), projection_mat_dict[f"conv{layer_ind}"].transpose(0,1)).view_as(layer.weight.data)
                     layer_ind+=1
                 elif isinstance(layer, nn.Linear):
-                    # Last layer check? 
-                    if layer_ind+1 == self.num_layer:
-                        layer.weight.data = torch.mm(layer.weight.data.flatten(1), projection_mat_dict["pre"][f"fc{layer_ind}"].transpose(0,1)).view_as(layer.weight.data)
-                        
-                    else:
-                        layer.weight.data = torch.mm( projection_mat_dict["post"][f"fc{layer_ind}"].transpose(0,1),torch.mm(layer.weight.data.flatten(1), projection_mat_dict["pre"][f"fc{layer_ind}"].transpose(0,1)) ).view_as(layer.weight.data)
-                        if layer.bias is not None:
-                            layer.bias.data = torch.mm(layer.bias.data.unsqueeze(0), projection_mat_dict["post"][f"fc{layer_ind}"]).squeeze(0)
+                    layer.weight.data = torch.mm(layer.weight.data.flatten(1), projection_mat_dict[f"fc{layer_ind}"].transpose(0,1)).view_as(layer.weight.data)
                     layer_ind+=1
                 else:
                     continue
@@ -138,14 +154,14 @@ cfg = {
 }
 
 
-def vgg11(num_classes = 10, dataset="imagenet"):
+def vgg11(num_classes = 10, dataset="imagenet", do_log_softmax=True):
     """VGG 11-layer model (configuration "A")"""
-    return VGG(make_layers(cfg['A']), num_classes=num_classes, dataset=dataset)
+    return VGG(make_layers(cfg['A']), num_classes=num_classes, dataset=dataset, do_log_softmax=do_log_softmax)
 
 
-def vgg11_bn(num_classes = 10, dataset="imagenet"):
+def vgg11_bn(num_classes = 10, dataset="imagenet", do_log_softmax=True):
     """VGG 11-layer model (configuration "A") with batch normalization"""
-    return VGG(make_layers(cfg['A'], batch_norm=True), num_classes=num_classes, dataset=dataset)
+    return VGG(make_layers(cfg['A'], batch_norm=True), num_classes=num_classes, dataset=dataset, do_log_softmax=do_log_softmax)
 
 
 def vgg13(num_classes = 10, dataset="imagenet"):

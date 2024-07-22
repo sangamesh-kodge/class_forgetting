@@ -11,7 +11,25 @@ authors:
   given-names: "Kaushik"
   orcid: "https://orcid.org/0000-0002-0735-9695"
 title: "Deep Unlearning: Fast and Efficient Gradient-free Class Forgetting"
-#version: 2.0.4
+version: 2.0.4
 #doi: 10.48550/arXiv.2312.00761
 date-released: 2024-07-19
 url: "https://openreview.net/forum?id=BmI5p6wBi0"
+
+preferred-citation:
+  type: article
+  authors:
+  - family-names: "Kodge"
+    given-names: "Sangamesh"
+    orcid: "https://orcid.org/0000-0001-9713-5400"
+  - family-names: "Saha"
+    given-names: "Gobinda"
+    orcid: "https://orcid.org/0000-0001-5756-6679"
+  - family-names: "Roy"
+    given-names: "Kaushik"
+    orcid: "https://orcid.org/0000-0002-0735-9695"
+  journal: "Transaction on Machine Learning Research"
+  month: 7
+  title: "Deep Unlearning: Fast and Efficient Gradient-free Class Forgetting"
+  year: 2024
+

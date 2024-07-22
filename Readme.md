@@ -35,7 +35,7 @@ Kindly cite the paper if you use the code. Thanks!
 
 ### APA
 ```
-Sangamesh Kodge, Gobinda Saha, & Kaushik Roy. Deep Unlearning: Fast and Efficient Gradient-free Class Forgetting. Transactions on Machine Learning Research (TMLR), 2024
+Kodge, Sangamesh, Gobinda Saha, and Kaushik Roy. "Deep Unlearning: Fast and Efficient Gradient-Free Class Forgetting."
 ```
 
 ### Bibtex
@@ -43,9 +43,11 @@ Sangamesh Kodge, Gobinda Saha, & Kaushik Roy. Deep Unlearning: Fast and Efficien
 @article{
 kodge2024deep,
 title={Deep Unlearning: Fast and Efficient Gradient-free Class Forgetting},
-author={Kodge, Sangamesh and Saha, Gobinda and Roy, Kaushik},
+author={Sangamesh Kodge and Gobinda Saha and Kaushik Roy},
 journal={Transactions on Machine Learning Research},
+issn={2835-8856},
 year={2024},
 url={https://openreview.net/forum?id=BmI5p6wBi0},
+note={}
 }
 ```

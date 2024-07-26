@@ -125,7 +125,7 @@ class Bottleneck(nn.Module):
         out, layer_acts = forward_cache_activations(out, self.conv2, f"{block_key}.conv2", max_samples)
         act.update(layer_acts)        
         out = F.relu(self.bn2(out) )
-        out, layer_acts = forward_cache_activations(out, self.conv3, f"{block_key}.conv2", max_samples)
+        out, layer_acts = forward_cache_activations(out, self.conv3, f"{block_key}.conv3", max_samples)
         act.update(layer_acts)   
         out = self.bn3(out)
         for layer in self.downsample: 
@@ -137,7 +137,7 @@ class Bottleneck(nn.Module):
 
 
 
-    def get_activations(self, x, block_key, max_samples=10000):
+    def get_svd_directions(self, x, block_key, max_samples=10000):
         identity = x
         out, U, S = forward_cache_svd(x, self.conv1, f"{block_key}.conv1", max_samples)
         out = F.relu(self.bn1(out))
@@ -145,7 +145,7 @@ class Bottleneck(nn.Module):
         U.update(layer_u)        
         S.update(layer_s)
         out = F.relu(self.bn2(out) )
-        out, layer_u, layer_s = forward_cache_activations(out, self.conv3, f"{block_key}.conv2", max_samples)
+        out, layer_u, layer_s = forward_cache_activations(out, self.conv3, f"{block_key}.conv3", max_samples)
         U.update(layer_u)        
         S.update(layer_s)
         out = self.bn3(out)
@@ -156,6 +156,7 @@ class Bottleneck(nn.Module):
         out +=identity
         out = F.relu(out)
         return U, S, out
+    
     def get_scaled_projections(self, x, block_key, alpha, max_samples=10000):
         identity = x
         out, proj = forward_cache_projections(x, self.conv1, f"{block_key}.conv1", max_samples)
